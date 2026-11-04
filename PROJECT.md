@@ -1,101 +1,141 @@
-# PROJECT.md — Uptime Guardian (Telegram Multi-Function Bot)
+# 📘 NOONA: Project Documentation
 
-> **Note for Claude:** Read this file fully before touching the code. The owner (Hinglish speaker, mobile user) will paste/upload the latest `bot.py` along with this file. Continue from here, keep the rules below, and update this file when features change.
+Technical notes for the NOONA bot. For setup and usage, see `README.md`.
 
 ---
 
-## 1. Goal
-A private, **owner-only** Telegram bot hosted on **Render** that monitors everything on **UptimeRobot**, alerts on down/up, and sends a daily report. It is the base for a bigger **multi-function bot** — more features will be added over time.
+## 🎯 Purpose
 
-## 2. Tech Stack
-- Python 3.11+
-- `python-telegram-bot[job-queue]==21.6` (async, polling)
-- `httpx` (UptimeRobot API calls)
-- `aiohttp` (health web server for Render + UptimeRobot)
-- Hosting: Render **Web Service** (free tier ok)
-- Files: `bot.py`, `requirements.txt`, `PROJECT.md`
+NOONA is an owner-only Telegram bot that monitors websites through the UptimeRobot API. It alerts the owner on status changes, sends a daily report, and lets the owner manage monitors from chat.
 
-## 3. Environment Variables (Render → Environment)
-| Name | Required | Meaning |
-|---|---|---|
-| `BOT_TOKEN` | ✅ | Token from @BotFather |
-| `UPTIMEROBOT_API_KEY` | ✅ | UptimeRobot **Main API Key** (read-write; needed for add/remove/pause) |
-| `OWNER_ID` | ✅ | Owner's numeric Telegram ID |
-| `TZ_NAME` | ❌ | Timezone, default `Asia/Kolkata` |
-| `CHECK_EVERY` | ❌ | Monitor poll interval in sec, default `60` |
-| `WELCOME_IMAGE` | ❌ | Image URL for /start, default `https://imgyx.pages.dev/ZkcBn` |
-| `NOTIFY_STARTUP` | ❌ | `1` = message owner on each start, `0` = off |
-| `PYTHON_VERSION` | ✅ (Render) | Set `3.12.8` (Render defaults to 3.14 which breaks old PTB) |
-| `PORT` | auto | Set by Render |
+**Persona:** flirty, romantic, and loyal to her owner. All user-facing text is in English.
 
-## 4. Deploy on Render
-1. Push files to GitHub.
-2. Render → New → **Web Service** → connect repo.
-3. Build: `pip install -r requirements.txt`
-4. Start: `python bot.py`
-5. Add the env vars above.
-6. In **UptimeRobot** add an HTTP monitor → `https://<your-service>.onrender.com/health` (5 min interval). This keeps Render awake and monitors the bot itself.
-7. Owner must send `/start` to the bot once (so the bot can DM the owner).
+---
 
-## 5. How It Works
-- **Owner guard:** `TypeHandler(Update, guard)` in group `-1` runs before every handler. If `user.id != OWNER_ID`, bot replies `I Gave My Body To My Owner` and stops processing (`ApplicationHandlerStop`). Works for commands, messages (private chat) and button clicks.
-- **Command registry:** `@command("name", "description")` decorator registers handler + adds it to /help and the Telegram command menu (menu is set only for owner via `BotCommandScopeChat`).
-- **Alerts:** `check_job` runs every `CHECK_EVERY` sec, calls UptimeRobot `getMonitors`, compares with `last_status` (in-memory). Status `2` = up, `8`/`9` = down, `0` = paused. First run after boot is silent (just loads state).
-- **Daily report:** `daily_job` at 00:00 (`TZ_NAME`) builds a report for the previous day using UptimeRobot logs (`logs=1`, `logs_start_date`, `logs_end_date`, `custom_uptime_ranges`). No database needed; history survives restarts.
-- **Health server:** aiohttp serves `/`, `/health`, `/ping` returning JSON. GET and HEAD work (UptimeRobot-friendly).
-- **/start:** owner gets photo + welcome caption + inline menu buttons. If the image fails, falls back to text.
-- All messages use **HTML parse mode**; always wrap dynamic text with `esc()`.
+## 🧱 Tech Stack
 
-## 6. Commands (owner only)
-| Command | Description |
+| Part | Choice |
 |---|---|
-| `/start` | Welcome photo + menu buttons |
-| `/help` | List of commands (auto-generated) |
-| `/status` | Summary: up / down / paused counts |
-| `/monitors` | All monitors with ID, status, URL |
-| `/add <name> <url>` | Create HTTP monitor (5 min interval) |
-| `/remove <id>` | Delete monitor |
-| `/pause <id>` / `/resume <id>` | Pause / resume monitor |
-| `/report [hours]` | Report for last N hours (default 24, max 720) |
-| `/ping` | Bot uptime + UptimeRobot API latency |
+| Language | Python 3.10+ |
+| Telegram | `python-telegram-bot` with the `job-queue` extra |
+| HTTP client | `httpx` (async) |
+| Web server | `aiohttp` (health endpoint) |
+| Monitoring data | UptimeRobot API v2 |
+| Hosting | Render (Web Service) |
 
-Automatic: 🔴 down alert, 🟢 back-up alert (with downtime duration), 📊 daily report at 12:00 AM.
+---
 
-## 7. How To Add A New Feature
-```python
-@command("mycmd", "What it does")
-async def mycmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello owner")
-```
-- Put new commands in the **COMMANDS section** of `bot.py`.
-- Need a new button? Add to `menu_keyboard()` with `callback_data="m:<key>"` and handle in `on_button()`.
-- Need a new schedule? `app.job_queue.run_repeating / run_daily` in `main()`.
-- New pip package? Add to `requirements.txt`.
-- When the file gets too big, split into modules (`features/`), keeping the registry pattern.
+## 🗂 Structure of `bot.py`
 
-## 8. Rules / Decisions (do not break)
-1. **Owner-only, always.** Every new feature must sit behind the guard. Never add a handler that bypasses it.
-2. Non-owner reply text is exactly: `I Gave My Body To My Owner`.
-3. Keep the **health endpoint** alive — Render needs a bound port and UptimeRobot triggers it.
-4. Never hardcode secrets; use env vars.
-5. Free Render filesystem is ephemeral — don't store important data in local files. If persistence is needed, use a DB (Render Postgres / MongoDB Atlas / Supabase) and note it here.
-6. UptimeRobot free plan: 50 monitors, 5-min interval, API limit 10 req/min — keep `CHECK_EVERY >= 60`.
-7. Reply style for the owner: Hinglish, short, mobile-friendly.
+| Section | What it contains |
+|---|---|
+| **Fonts** | `script()` and `soft()` convert A-Z / a-z into Unicode font styles |
+| **Config** | Environment variables, constants, status labels |
+| **Helpers** | `esc`, `api`, `err`, `fmt_dur`, `fmt_t`, `send_html` |
+| **Text builders** | `text_monitors`, `text_status`, `build_report`, `text_help`, `menu_keyboard` |
+| **Security guard** | `guard` blocks everyone except the owner |
+| **Commands** | Registered with the `@command` decorator |
+| **Inline buttons** | `on_button` handles the `m:*` callbacks |
+| **Background jobs** | `check_job` (alerts) and `daily_job` (report) |
+| **Web server** | `start_web` serves `/`, `/health`, `/ping` |
+| **Main** | Builds the app, registers handlers and jobs, starts polling |
 
-## 9. Known Limitations
-- `last_status` / `down_since` live in memory: if the bot restarts while a monitor is down, the "DOWN" alert is not repeated (the "BACK UP" alert still comes, duration counted from restart).
-- Down detection is as fast as `CHECK_EVERY` (UptimeRobot's own check interval is 5 min on free plan, so real delay can be up to ~5–6 min).
-- Render free tier sleeps if nothing pings it → the UptimeRobot monitor on `/health` is required.
+---
 
-## 10. Roadmap / Ideas (not built yet)
-- Alert on SSL expiry / domain expiry
-- Weekly + monthly report
-- Inline buttons for pause/resume/delete per monitor
-- Multiple admins (list of IDs)
-- Response-time graphs (chart image)
-- Other utilities: reminders, notes, broadcast, downloader, etc. (owner will decide)
+## 🎨 Fonts
 
-## 11. Changelog
-- v1: UptimeRobot alerts, daily report, add/remove monitors, owner-only.
-- v2.1: Python 3.14 event-loop fix (asyncio.set_event_loop) + `.python-version` pinned to 3.12.8.
-- v2: /start photo + menu, non-owner deny message, pause/resume, /status, /ping, /report [hours], command registry, health endpoint for UptimeRobot, this PROJECT.md.
+Telegram bots cannot change typefaces, so NOONA uses two Unicode text styles:
+
+| Helper | Style | Used for |
+|---|---|---|
+| `script(text)` | Mathematical Bold Script (𝓗𝓮𝓵𝓵𝓸) | Titles and headings |
+| `soft(text)` | Mathematical Sans-Serif Bold Italic (𝙃𝙚𝙡𝙡𝙤) | Labels and captions |
+
+Only letters are converted. Digits, emojis, punctuation, IDs, names, and URLs stay in plain text so they remain readable and copyable. Apply the helpers only to **static text you write**, never to user data.
+
+---
+
+## 🔐 Security
+
+- A `TypeHandler` in group `-1` runs before every other handler.
+- If the sender is not `OWNER_ID`, it replies with `DENY_TEXT` and raises `ApplicationHandlerStop`.
+- Inline button presses from non-owners get the denial as an alert.
+- The command menu is registered only for the owner's chat.
+- Secrets come from environment variables only and are never committed.
+
+---
+
+## 🔔 Alert Logic
+
+`check_job` runs every `CHECK_EVERY` seconds.
+
+1. Fetch all monitors from UptimeRobot.
+2. Compare each monitor's status with the last known status (kept in memory).
+3. **Up → Down (status 8 or 9):** send a DOWN alert and record the start time.
+4. **Down → Up (status 2):** send a BACK UP alert with the downtime duration.
+5. On the first run after a restart, no alerts are sent. Current states are only recorded.
+6. Monitors that no longer exist are removed from memory.
+
+State lives in memory only, so a restart forgets how long a monitor has been down.
+
+---
+
+## 📊 Reports
+
+- **Daily report:** runs at 00:00 in `TZ_NAME` and covers the previous full day.
+- **On demand:** `/report [hours]` covers the last N hours (1 to 720, default 24).
+- Each monitor shows its uptime percentage and a list of down periods with start and end times.
+
+---
+
+## 🌐 Web Server
+
+| Route | Response |
+|---|---|
+| `/`, `/health`, `/ping` | `{"status": "ok", "bot_uptime_sec": <int>}` |
+
+Render requires an open port, and UptimeRobot pings `/health` to keep the service awake.
+
+---
+
+## ⚙️ Environment Variables
+
+| Variable | Required | Default |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | n/a |
+| `UPTIMEROBOT_API_KEY` | ✅ | n/a |
+| `OWNER_ID` | ✅ | n/a |
+| `TZ_NAME` | ❌ | `Asia/Kolkata` |
+| `PORT` | ❌ | `10000` |
+| `CHECK_EVERY` | ❌ | `60` |
+| `WELCOME_IMAGE` | ❌ | built-in URL |
+| `NOTIFY_STARTUP` | ❌ | `1` |
+
+---
+
+## 🧩 Adding a Feature
+
+1. Write an async function that takes `(update, context)`.
+2. Decorate it with `@command("name", "Short description 💋")`.
+3. The command is added to the Telegram menu and `/help` automatically.
+4. For long output, use `send_html()` so messages split safely at 3800 characters.
+5. Keep the persona: English only, warm, flirty, and with emojis. Use `script()` for titles and `soft()` for labels.
+
+---
+
+## ⚠️ Notes and Limitations
+
+- Alert state is in memory only (resets on restart or redeploy).
+- The bot uses long polling, so run only **one instance** at a time.
+- `drop_pending_updates=True` discards messages sent while the bot was offline.
+- The startup message fails quietly if the owner has never sent `/start`.
+- Unicode font styles can look different across devices, and screen readers may read them poorly.
+
+---
+
+## 🗺 Ideas for Later
+
+- Persist alert state in a small database or file
+- Alert on SSL expiry
+- Per-monitor mute and snooze buttons
+- Weekly summary report 💌
