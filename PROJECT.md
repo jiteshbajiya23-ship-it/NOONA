@@ -25,6 +25,7 @@ A private, **owner-only** Telegram bot hosted on **Render** that monitors everyt
 | `CHECK_EVERY` | ❌ | Monitor poll interval in sec, default `60` |
 | `WELCOME_IMAGE` | ❌ | Image URL for /start, default `https://imgyx.pages.dev/ZkcBn` |
 | `NOTIFY_STARTUP` | ❌ | `1` = message owner on each start, `0` = off |
+| `PYTHON_VERSION` | ✅ (Render) | Set `3.12.8` (Render defaults to 3.14 which breaks old PTB) |
 | `PORT` | auto | Set by Render |
 
 ## 4. Deploy on Render
@@ -96,4 +97,5 @@ async def mycmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ## 11. Changelog
 - v1: UptimeRobot alerts, daily report, add/remove monitors, owner-only.
+- v2.1: Python 3.14 event-loop fix (asyncio.set_event_loop) + `.python-version` pinned to 3.12.8.
 - v2: /start photo + menu, non-owner deny message, pause/resume, /status, /ping, /report [hours], command registry, health endpoint for UptimeRobot, this PROJECT.md.

@@ -4,6 +4,7 @@ Host: Render (Web Service)  |  Keep-alive: ping /health from UptimeRobot
 See PROJECT.md for full documentation.
 """
 import os
+import asyncio
 import time
 import html
 import logging
@@ -466,6 +467,9 @@ async def post_init(app: Application):
 # MAIN
 # =====================================================================
 def main():
+    # Python 3.14 fix: main thread me default event loop nahi hota
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(TypeHandler(Update, guard), group=-1)  # owner-only gate
