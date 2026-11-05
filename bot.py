@@ -1,9 +1,8 @@
 """
-NOONA 💋 Owner-only Telegram bot | UptimeRobot monitoring + daily report
+Owner-only Telegram bot | UptimeRobot monitoring + daily report
 Host: Render (Web Service) | Keep-alive: ping /health from UptimeRobot
 See PROJECT.md for full documentation.
 """
-
 import os
 import asyncio
 import time
@@ -19,9 +18,11 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -32,35 +33,11 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# FIX: httpx logs full request URLs at INFO, which leaks the bot token
+# (https://api.telegram.org/bot<TOKEN>/getUpdates) into Render logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
-
-# =====================================================================
-# FONTS (Telegram can't change typefaces, so we use two Unicode styles)
-#   script() -> 𝓑𝓸𝓵𝓭 𝓢𝓬𝓻𝓲𝓹𝓽      for titles / headings
-#   soft()   -> 𝙎𝙖𝙣𝙨 𝘽𝙤𝙡𝙙 𝙄𝙩𝙖𝙡𝙞𝙘  for labels / captions
-# Only letters A-Z / a-z are converted; everything else is untouched.
-# =====================================================================
-
-
-def _restyle(s: str, upper_start: int, lower_start: int) -> str:
-    out = []
-    for ch in s:
-        if "A" <= ch <= "Z":
-            out.append(chr(upper_start + ord(ch) - ord("A")))
-        elif "a" <= ch <= "z":
-            out.append(chr(lower_start + ord(ch) - ord("a")))
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def script(s: str) -> str:
-    return _restyle(s, 0x1D4D0, 0x1D4EA)  # Mathematical Bold Script
-
-
-def soft(s: str) -> str:
-    return _restyle(s, 0x1D63C, 0x1D656)  # Mathematical Sans-Serif Bold Italic
-
 
 # =====================================================================
 # CONFIG
@@ -74,18 +51,11 @@ CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "60"))  # seconds
 WELCOME_IMAGE = os.environ.get("WELCOME_IMAGE", "https://imgyx.pages.dev/ZkcBn")
 NOTIFY_STARTUP = os.environ.get("NOTIFY_STARTUP", "1") == "1"
 
-DENY_TEXT = "Sorry sweetheart 💋 my heart and my body belong to my owner only. Nice try though 😘"
-
+DENY_TEXT = "I Gave My Body To My Owner"
 START_TIME = time.time()
-DIV = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-STATUS = {
-    0: "⏸ Paused",
-    1: "⏳ Waiting",
-    2: "💚 Up",
-    8: "🧡 Looks down",
-    9: "💔 Down",
-}
+STATUS = {0: "⏸ Paused", 1: "⏳ Not checked", 2: "🟢 Up", 8: "🟠 Seems down", 9: "🔴 Down"}
 DOWN_STATES = (8, 9)
 
 # runtime state (memory only)
@@ -99,12 +69,10 @@ HANDLERS: list[CommandHandler] = []
 
 def command(name: str, desc: str):
     """Decorator: register an owner-only command. Add new features with this."""
-
     def deco(fn):
         COMMANDS.append((name, desc))
         HANDLERS.append(CommandHandler(name, fn))
         return fn
-
     return deco
 
 
@@ -124,6 +92,24 @@ async def api(endpoint: str, **params) -> dict:
     except Exception as e:  # network / json errors
         log.warning("UptimeRobot API error: %s", e)
         return {"stat": "fail", "error": {"message": str(e)}}
+
+
+async def get_monitors(**params) -> dict:
+    """getMonitors with pagination (API returns max 50 per page)."""
+    out: list = []
+    offset = 0
+    while True:
+        data = await api("getMonitors", offset=offset, limit=50, **params)
+        if data.get("stat") != "ok":
+            return data
+        page = data.get("monitors", [])
+        out.extend(page)
+        total = int((data.get("pagination") or {}).get("total", len(out)))
+        if not page or len(out) >= total:
+            break
+        offset = len(out)
+    data["monitors"] = out
+    return data
 
 
 def err(data: dict) -> str:
@@ -147,109 +133,116 @@ def fmt_dur(sec) -> str:
     return f"{s}s"
 
 
-def fmt_t(ts: int) -> str:
-    return datetime.fromtimestamp(ts, TZ).strftime("%I:%M %p")
+def fmt_t(ts: int, with_date: bool = False) -> str:
+    fmt = "%d %b %I:%M %p" if with_date else "%I:%M %p"
+    return datetime.fromtimestamp(ts, TZ).strftime(fmt)
+
+
+async def retry_tg(fn, *args, tries: int = 5, delay: float = 3, label: str = "", **kwargs):
+    """Retry a Telegram call on timeouts / network errors. Never raises."""
+    for i in range(1, tries + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except NetworkError as e:  # includes TimedOut
+            log.warning("%s attempt %d/%d failed: %s", label or "telegram call", i, tries, e)
+            await asyncio.sleep(delay * i)
+        except Exception as e:  # Forbidden, BadRequest etc. -> no point retrying
+            log.warning("%s failed: %s", label or "telegram call", e)
+            return None
+    return None
 
 
 async def send_html(bot, chat_id: int, text: str):
     """Send long text safely (split on line boundaries, HTML mode)."""
     chunk = ""
     for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > 3800:
-            await bot.send_message(
-                chat_id, chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-            )
+        if chunk and len(chunk) + len(line) + 1 > 3800:
+            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
+                                   link_preview_options=NO_PREVIEW)
             chunk = ""
         chunk += line + "\n"
     if chunk.strip():
-        await bot.send_message(
-            chat_id, chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
+        await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
+                               link_preview_options=NO_PREVIEW)
 
 
 # =====================================================================
 # TEXT BUILDERS (used by commands AND buttons)
 # =====================================================================
 async def text_monitors() -> str:
-    data = await api("getMonitors")
+    data = await get_monitors()
     if data.get("stat") != "ok":
-        return f"💔 Oh no, darling: {esc(err(data))}"
+        return f"❌ {esc(err(data))}"
     if not data["monitors"]:
-        return "Nothing to watch yet, darling 🥺\nUse /add and give me something to adore 💞"
-
-    lines = [f"📡 <b>{script('My Monitors')}</b>", DIV, ""]
+        return "Koi monitor nahi hai. /add se add karo."
+    lines = ["<b>📡 Monitors</b>", ""]
     for m in data["monitors"]:
         lines.append(f"{STATUS.get(m['status'], m['status'])} <b>{esc(m['friendly_name'])}</b>")
-        lines.append(f"🆔 <code>{m['id']}</code>")
-        lines.append(f"🔗 {esc(m['url'])}")
+        lines.append(f"ID: <code>{m['id']}</code>")
+        lines.append(f"{esc(m.get('url', ''))}")
         lines.append("")
     return "\n".join(lines)
 
 
 async def text_status() -> str:
-    data = await api("getMonitors")
+    data = await get_monitors()
     if data.get("stat") != "ok":
-        return f"💔 Oh no, darling: {esc(err(data))}"
+        return f"❌ {esc(err(data))}"
     ms = data["monitors"]
     up = sum(1 for m in ms if m["status"] == 2)
     paused = sum(1 for m in ms if m["status"] == 0)
     down = [m for m in ms if m["status"] in DOWN_STATES]
-
     lines = [
-        f"📈 <b>{script('Status Report')}</b>",
-        DIV,
-        f"🌹 {soft('Total')}: {len(ms)}",
-        f"💚 {soft('Up')}: {up}",
-        f"💔 {soft('Down')}: {len(down)}",
-        f"⏸ {soft('Paused')}: {paused}",
+        "<b>📈 Status</b>",
+        f"Total: {len(ms)}",
+        f"🟢 Up: {up}",
+        f"🔴 Down: {len(down)}",
+        f"⏸ Paused: {paused}",
     ]
     if down:
         lines.append("")
-        lines.append(f"🥀 <b>{soft('Hurting right now')}:</b>")
+        lines.append("<b>Abhi down:</b>")
         for m in down:
             since = down_since.get(m["id"])
-            extra = f" (for {fmt_dur(time.time() - since)})" if since else ""
+            extra = f" ({fmt_dur(time.time() - since)} se)" if since else ""
             lines.append(f"• {esc(m['friendly_name'])}{extra}")
     else:
-        lines.append("")
-        lines.append("✨ Everything is perfect, baby. Not a single hiccup 😘")
+        lines.append("\n✅ Sab kuch theek chal raha hai")
     return "\n".join(lines)
 
 
 async def build_report(start: int, end: int, title: str) -> str:
-    data = await api(
-        "getMonitors",
+    data = await get_monitors(
         logs=1,
         logs_start_date=start,
         logs_end_date=end,
         custom_uptime_ranges=f"{start}_{end}",
     )
     if data.get("stat") != "ok":
-        return f"💔 UptimeRobot error: {esc(err(data))}"
+        return f"❌ UptimeRobot error: {esc(err(data))}"
 
-    lines = [f"📊 <b>{script(title)}</b>", DIV, ""]
+    wd = (end - start) > 86400  # show dates for reports longer than 1 day
+    lines = [f"<b>📊 {esc(title)}</b>", ""]
     total_incidents = 0
     for m in data["monitors"]:
         uptime = m.get("custom_uptime_ranges", "—")
         downs = [l for l in m.get("logs", []) if l["type"] == 1]
         total_incidents += len(downs)
-
-        lines.append(f"💞 <b>{esc(m['friendly_name'])}</b> — {STATUS.get(m['status'], m['status'])}")
-        lines.append(f"⏱ {soft('Uptime')}: {esc(uptime)}%")
+        lines.append(f"<b>{esc(m['friendly_name'])}</b> — {STATUS.get(m['status'], m['status'])}")
+        lines.append(f"Uptime: {esc(uptime)}%")
         if not downs:
-            lines.append("✅ No downtime at all. I kept it safe for you 💖")
+            lines.append("✅ Koi downtime nahi")
         for idx, l in enumerate(downs):
             began = l["datetime"]
             back = began + l["duration"]
             if idx == 0 and m["status"] in DOWN_STATES:
-                lines.append(f"💔 Down since {fmt_t(began)}, and still down. I'm worried 🥺")
+                lines.append(f"🔴 {fmt_t(began, wd)} se down — abhi bhi down hai")
             else:
                 lines.append(
-                    f"💔 Down {fmt_t(began)} → 💚 Up {fmt_t(back)} ({fmt_dur(l['duration'])})"
+                    f"🔴 Down {fmt_t(began, wd)} → 🟢 Up {fmt_t(back, wd)} ({fmt_dur(l['duration'])})"
                 )
         lines.append("")
-
-    lines.append(f"🎀 {soft('Monitors')}: {len(data['monitors'])} | {soft('Incidents')}: {total_incidents}")
+    lines.append(f"Monitors: {len(data['monitors'])} | Incidents: {total_incidents}")
     return "\n".join(lines)
 
 
@@ -262,21 +255,17 @@ def menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("📊 Report", callback_data="m:report"),
-                InlineKeyboardButton("💌 Help", callback_data="m:help"),
+                InlineKeyboardButton("❓ Help", callback_data="m:help"),
             ],
         ]
     )
 
 
 def text_help() -> str:
-    lines = [f"💌 <b>{script('What I Can Do For You')}</b>", DIV, ""]
+    lines = ["<b>🛠 Commands</b>", ""]
     for name, desc in COMMANDS:
         lines.append(f"/{name} — {esc(desc)}")
-    lines += [
-        "",
-        "🔔 I'll whisper to you the moment something goes down or comes back up, "
-        "and send a daily report at 12:00 AM 🌙",
-    ]
+    lines += ["", "🔔 Auto: down/up alerts + daily report 12:00 AM"]
     return "\n".join(lines)
 
 
@@ -300,24 +289,19 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 # COMMANDS (add new features below using @command)
 # =====================================================================
-@command("start", "Come say hello 💋")
+@command("start", "Bot start + menu")
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (
-        f"💘 <b>{script('Welcome back, my love')}</b>\n"
-        f"{DIV}\n\n"
-        "I'm <b>Noona</b>, your devoted Uptime Guardian 🌹\n"
-        "I'm watching every monitor for you, darling. The second one goes down, "
-        "I'll whisper it in your ear 💌\n\n"
-        "And every night at midnight, I'll send you a little report 🌙✨"
+        "👑 <b>Welcome back, Owner!</b>\n\n"
+        "Main tumhara Uptime Guardian hoon.\n"
+        "Har monitor pe nazar hai — down hote hi alert, "
+        "aur roz 12:00 AM report. 🚀"
     )
     chat_id = update.effective_chat.id
     try:
         await context.bot.send_photo(
-            chat_id,
-            WELCOME_IMAGE,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=menu_keyboard(),
+            chat_id, WELCOME_IMAGE, caption=caption,
+            parse_mode=ParseMode.HTML, reply_markup=menu_keyboard(),
         )
     except Exception as e:
         log.warning("Welcome image failed: %s", e)
@@ -326,28 +310,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-@command("help", "See everything I can do 💌")
+@command("help", "Saare commands")
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, text_help())
 
 
-@command("status", "Quick summary: up, down, paused 📈")
+@command("status", "Quick summary (up/down/paused)")
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, await text_status())
 
 
-@command("monitors", "All your monitors with IDs 📡")
+@command("monitors", "Saare monitors + ID")
 async def monitors_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, await text_monitors())
 
 
-@command("add", "Add a monitor: /add <name> <url> 💞")
+@command("add", "Monitor add: /add <name> <url>")
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         return await update.message.reply_text(
-            "Tell me what to watch, darling 😘\n"
-            "Use: /add <name> <url>\n"
-            "Example: /add MyBot https://mybot.onrender.com"
+            "Use: /add <name> <url>\nEx: /add MyBot https://mybot.onrender.com"
         )
     url = context.args[-1]
     if not url.startswith(("http://", "https://")):
@@ -355,71 +337,57 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args[:-1])
     data = await api("newMonitor", friendly_name=name, url=url, type=1, interval=300)
     if data.get("stat") == "ok":
-        await update.message.reply_text(
-            f"💞 Added {name}! I'll watch it closely for you.\n🆔 ID: {data['monitor']['id']}"
-        )
+        await update.message.reply_text(f"✅ Added: {name}\nID: {data['monitor']['id']}")
     else:
-        await update.message.reply_text(f"💔 Oh no, darling: {err(data)}")
+        await update.message.reply_text(f"❌ {err(data)}")
 
 
-@command("remove", "Delete a monitor: /remove <id> 🗑")
+@command("remove", "Monitor delete: /remove <id>")
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
-        return await update.message.reply_text(
-            "Use: /remove <id>\nYou can find the ID with /monitors 💋"
-        )
+        return await update.message.reply_text("Use: /remove <id>\nID /monitors se dekho.")
     data = await api("deleteMonitor", id=context.args[0])
-    await update.message.reply_text(
-        "🗑 Done, it's gone. Goodbye, little monitor 💔"
-        if data.get("stat") == "ok"
-        else f"💔 Oh no, darling: {err(data)}"
-    )
+    await update.message.reply_text("🗑 Monitor removed." if data.get("stat") == "ok"
+                                    else f"❌ {err(data)}")
 
 
-@command("pause", "Pause a monitor: /pause <id> ⏸")
+@command("pause", "Monitor pause: /pause <id>")
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
         return await update.message.reply_text("Use: /pause <id>")
     data = await api("editMonitor", id=context.args[0], status=0)
-    await update.message.reply_text(
-        "⏸ Paused. Taking a little break together 😌"
-        if data.get("stat") == "ok"
-        else f"💔 Oh no, darling: {err(data)}"
-    )
+    await update.message.reply_text("⏸ Paused." if data.get("stat") == "ok"
+                                    else f"❌ {err(data)}")
 
 
-@command("resume", "Resume a monitor: /resume <id> ▶️")
+@command("resume", "Monitor resume: /resume <id>")
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
         return await update.message.reply_text("Use: /resume <id>")
     data = await api("editMonitor", id=context.args[0], status=1)
-    await update.message.reply_text(
-        "▶️ Resumed. Back to watching, just for you 😘"
-        if data.get("stat") == "ok"
-        else f"💔 Oh no, darling: {err(data)}"
-    )
+    await update.message.reply_text("▶️ Resumed." if data.get("stat") == "ok"
+                                    else f"❌ {err(data)}")
 
 
-@command("report", "Report: /report [hours], default 24 📊")
+@command("report", "Report: /report [hours] (default 24)")
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours = 24
     if context.args and context.args[0].isdigit():
         hours = max(1, min(int(context.args[0]), 720))
     end = int(time.time())
-    text = await build_report(end - hours * 3600, end, f"Report: last {hours}h")
+    text = await build_report(end - hours * 3600, end, f"Report — last {hours}h")
     await send_html(context.bot, update.effective_chat.id, text)
 
 
-@command("ping", "Check my speed 🏓")
+@command("ping", "Bot + API speed check")
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0 = time.perf_counter()
     data = await api("getAccountDetails")
     api_ms = int((time.perf_counter() - t0) * 1000)
-    api_ok = "💚" if data.get("stat") == "ok" else "💔"
+    api_ok = "✅" if data.get("stat") == "ok" else "❌"
     await update.message.reply_text(
-        f"🏓 Pong, handsome!\n"
-        f"💞 I've been with you for {fmt_dur(time.time() - START_TIME)}\n"
-        f"📡 UptimeRobot API: {api_ok} {api_ms} ms"
+        f"🏓 Pong!\nBot uptime: {fmt_dur(time.time() - START_TIME)}\n"
+        f"UptimeRobot API: {api_ok} {api_ms} ms"
     )
 
 
@@ -429,7 +397,7 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    chat_id = q.message.chat_id
+    chat_id = q.message.chat_id if q.message else q.from_user.id
     key = q.data
 
     if key == "m:monitors":
@@ -438,7 +406,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await text_status()
     elif key == "m:report":
         end = int(time.time())
-        text = await build_report(end - 86400, end, "Report: last 24h")
+        text = await build_report(end - 86400, end, "Report — last 24h")
     elif key == "m:help":
         text = text_help()
     else:
@@ -449,8 +417,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 # BACKGROUND JOBS
 # =====================================================================
+async def startup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs once after start. Retries so Telegram timeouts on cold start don't matter."""
+    ok = await retry_tg(
+        context.bot.set_my_commands,
+        [BotCommand(n, d[:250]) for n, d in COMMANDS],
+        scope=BotCommandScopeChat(OWNER_ID),  # menu only for owner
+        label="set_my_commands",
+    )
+    if ok:
+        log.info("Command menu set")
+    if NOTIFY_STARTUP:
+        sent = await retry_tg(
+            context.bot.send_message, OWNER_ID,
+            "✅ Bot online ho gaya (deploy/restart).",
+            label="startup notify",
+        )
+        if sent is None:
+            log.warning("Startup notify not delivered (owner ne /start nahi kiya ya network issue)")
+
+
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
-    data = await api("getMonitors")
+    data = await get_monitors()
     if data.get("stat") != "ok":
         log.warning("getMonitors failed: %s", data)
         return
@@ -468,27 +456,25 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
                 down_since[mid] = now
             continue
 
-        if status in DOWN_STATES and prev not in DOWN_STATES:
-            down_since[mid] = now
-            await context.bot.send_message(
-                OWNER_ID,
-                f"💔 <b>{script('Down')}</b>: {name}\n"
-                f"🔗 {esc(m['url'])}\n"
-                f"🕒 {fmt_t(now)}\n\n"
-                "Don't worry, darling. I'm keeping an eye on it for you 🥺",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        elif status == 2 and prev in DOWN_STATES:
-            started = down_since.pop(mid, now)
-            await context.bot.send_message(
-                OWNER_ID,
-                f"💚 <b>{script('Back Up')}</b>: {name}\n"
-                f"⏱ It was down for {fmt_dur(now - started)}\n"
-                f"🌅 Offline {fmt_t(started)} → Online {fmt_t(now)}\n\n"
-                "All better now, baby 😘",
-                parse_mode=ParseMode.HTML,
-            )
+        try:
+            if status in DOWN_STATES and prev not in DOWN_STATES:
+                down_since[mid] = now
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"🔴 <b>DOWN</b>: {name}\n{esc(m.get('url', ''))}\n🕒 {fmt_t(now)}",
+                    parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                )
+            elif status == 2 and prev in DOWN_STATES:
+                started = down_since.pop(mid, now)
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"🟢 <b>BACK UP</b>: {name}\n"
+                    f"⏱ Down tha: {fmt_dur(now - started)}\n"
+                    f"Offline {fmt_t(started)} → Online {fmt_t(now)}",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:  # one failed alert must not break the others
+            log.warning("Alert send failed for %s: %s", mid, e)
 
     live = {m["id"] for m in data["monitors"]}
     for mid in list(last_status):
@@ -503,7 +489,21 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     start = end - 86400
     day = datetime.fromtimestamp(start, TZ).strftime("%d %b %Y")
     text = await build_report(start, end, f"Daily Report ({day})")
-    await send_html(context.bot, OWNER_ID, text)
+    try:
+        await send_html(context.bot, OWNER_ID, text)
+    except Exception as e:
+        log.warning("Daily report send failed: %s", e)
+
+
+# =====================================================================
+# ERROR HANDLER
+# =====================================================================
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    e = context.error
+    if isinstance(e, NetworkError):
+        log.warning("Network error (will retry automatically): %s", e)
+    else:
+        log.error("Unhandled error: %s", e, exc_info=e)
 
 
 # =====================================================================
@@ -525,36 +525,45 @@ async def start_web():
 
 async def post_init(app: Application):
     await start_web()
-    try:
-        await app.bot.set_my_commands(
-            [BotCommand(n, d[:250]) for n, d in COMMANDS],
-            scope=BotCommandScopeChat(OWNER_ID),  # menu only for owner
-        )
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
-    if NOTIFY_STARTUP:
-        try:
-            await app.bot.send_message(
-                OWNER_ID, "💋 I'm online and all yours again (deploy/restart) 💞"
-            )
-        except Exception as e:
-            log.warning("Startup notify failed (has the owner sent /start yet?): %s", e)
 
 
 # =====================================================================
 # MAIN
 # =====================================================================
 def main():
-    # Python 3.14 fix: the main thread has no default event loop
+    # Python 3.14 fix: main thread me default event loop nahi hota
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        # FIX: default timeouts are 5s -> "Timed out" on Render cold start
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(20)
+        .get_updates_pool_timeout(20)
+        .build()
+    )
+
     app.add_handler(TypeHandler(Update, guard), group=-1)  # owner-only gate
     for h in HANDLERS:
         app.add_handler(h)
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^m:"))
+    app.add_error_handler(on_error)
+
+    app.job_queue.run_once(startup_job, when=3)
     app.job_queue.run_repeating(check_job, interval=CHECK_EVERY, first=5)
     app.job_queue.run_daily(daily_job, time=dtime(0, 0, tzinfo=TZ))
-    app.run_polling(drop_pending_updates=True)
+
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+    )
 
 
 if __name__ == "__main__":
