@@ -17,7 +17,7 @@ NOONA is an owner-only Telegram bot that monitors websites through the UptimeRob
 | Part | Choice |
 |---|---|
 | Language | Python 3.10+ |
-| Telegram | `python-telegram-bot` with the `job-queue` extra |
+| Telegram | `python-telegram-bot` 21.x to 22.x with the `job-queue` extra (`>=21.0,<23`) |
 | HTTP client | `httpx` (async) |
 | Web server | `aiohttp` (health endpoint) |
 | Monitoring data | UptimeRobot API v2 |
@@ -31,12 +31,13 @@ NOONA is an owner-only Telegram bot that monitors websites through the UptimeRob
 |---|---|
 | **Fonts** | `script()` and `soft()` convert A-Z / a-z into Unicode font styles |
 | **Config** | Environment variables, constants, status labels |
-| **Helpers** | `esc`, `api`, `err`, `fmt_dur`, `fmt_t`, `send_html` |
+| **Helpers** | `esc`, `api`, `get_monitors` (paginated), `err`, `fmt_dur`, `fmt_t`, `retry_tg`, `send_html` |
 | **Text builders** | `text_monitors`, `text_status`, `build_report`, `text_help`, `menu_keyboard` |
 | **Security guard** | `guard` blocks everyone except the owner |
 | **Commands** | Registered with the `@command` decorator |
 | **Inline buttons** | `on_button` handles the `m:*` callbacks |
-| **Background jobs** | `check_job` (alerts) and `daily_job` (report) |
+| **Background jobs** | `startup_job` (command menu + online message), `check_job` (alerts) and `daily_job` (report) |
+| **Error handler** | `on_error` logs network blips as warnings and real bugs as errors |
 | **Web server** | `start_web` serves `/`, `/health`, `/ping` |
 | **Main** | Builds the app, registers handlers and jobs, starts polling |
 
@@ -62,6 +63,8 @@ Only letters are converted. Digits, emojis, punctuation, IDs, names, and URLs st
 - Inline button presses from non-owners get the denial as an alert.
 - The command menu is registered only for the owner's chat.
 - Secrets come from environment variables only and are never committed.
+- The `httpx` and `httpcore` loggers are set to `WARNING`. At `INFO` they print full request URLs, which include the bot token.
+- If a token ever shows up in logs or a chat, revoke it in @BotFather (`/revoke`) and update `BOT_TOKEN` on Render.
 
 ---
 
@@ -75,6 +78,7 @@ Only letters are converted. Digits, emojis, punctuation, IDs, names, and URLs st
 4. **Down → Up (status 2):** send a BACK UP alert with the downtime duration.
 5. On the first run after a restart, no alerts are sent. Current states are only recorded.
 6. Monitors that no longer exist are removed from memory.
+7. If one alert fails to send, it is logged and the remaining monitors are still processed.
 
 State lives in memory only, so a restart forgets how long a monitor has been down.
 
@@ -85,6 +89,7 @@ State lives in memory only, so a restart forgets how long a monitor has been dow
 - **Daily report:** runs at 00:00 in `TZ_NAME` and covers the previous full day.
 - **On demand:** `/report [hours]` covers the last N hours (1 to 720, default 24).
 - Each monitor shows its uptime percentage and a list of down periods with start and end times.
+- Reports longer than 24 hours include the date on every time, so "10:00 PM" is never ambiguous.
 
 ---
 
@@ -95,6 +100,18 @@ State lives in memory only, so a restart forgets how long a monitor has been dow
 | `/`, `/health`, `/ping` | `{"status": "ok", "bot_uptime_sec": <int>}` |
 
 Render requires an open port, and UptimeRobot pings `/health` to keep the service awake.
+
+---
+
+## 🛡 Reliability
+
+| Problem | How it is handled |
+|---|---|
+| Telegram calls time out on a Render cold start (default timeout is 5s) | Connect, read, write, and pool timeouts are raised to 20-30s in `main()` |
+| Startup calls (`set_my_commands`, online message) still fail | `retry_tg` retries up to 5 times with growing delays and never raises |
+| APScheduler skips a job that starts more than 1s late | Each job has a `misfire_grace_time` (`startup_job` 120s, `check_job` 30s, `daily_job` 600s) |
+| More than 50 monitors | `get_monitors` pages through the UptimeRobot API |
+| Temporary network errors during polling | `on_error` logs them as warnings and polling continues |
 
 ---
 
@@ -116,7 +133,7 @@ Render requires an open port, and UptimeRobot pings `/health` to keep the servic
 ## 🧩 Adding a Feature
 
 1. Write an async function that takes `(update, context)`.
-2. Decorate it with `@command("name", "Short description 💋")`.
+2. Decorate it with `@command("name", "Short description 💋")`. Menu descriptions must stay under 256 characters.
 3. The command is added to the Telegram menu and `/help` automatically.
 4. For long output, use `send_html()` so messages split safely at 3800 characters.
 5. Keep the persona: English only, warm, flirty, and with emojis. Use `script()` for titles and `soft()` for labels.
@@ -128,7 +145,9 @@ Render requires an open port, and UptimeRobot pings `/health` to keep the servic
 - Alert state is in memory only (resets on restart or redeploy).
 - The bot uses long polling, so run only **one instance** at a time.
 - `drop_pending_updates=True` discards messages sent while the bot was offline.
-- The startup message fails quietly if the owner has never sent `/start`.
+- The startup message is retried on network errors. If the owner has never sent `/start`, Telegram refuses it and it is only logged.
+- Render's free tier sleeps without traffic, so keep an UptimeRobot monitor pinging `/health`.
+- On redeploy, the old and new instance can overlap briefly. Telegram may report a `Conflict` for a few seconds, which clears on its own.
 - Unicode font styles can look different across devices, and screen readers may read them poorly.
 
 ---

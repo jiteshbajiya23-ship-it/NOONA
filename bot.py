@@ -1,6 +1,7 @@
 """
-Owner-only Telegram bot | UptimeRobot monitoring + daily report
+NOONA: owner-only Telegram bot | UptimeRobot monitoring + daily report
 Host: Render (Web Service) | Keep-alive: ping /health from UptimeRobot
+Persona: flirty, romantic, loyal to her owner. All user-facing text is English.
 See PROJECT.md for full documentation.
 """
 import os
@@ -33,11 +34,38 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-# FIX: httpx logs full request URLs at INFO, which leaks the bot token
-# (https://api.telegram.org/bot<TOKEN>/getUpdates) into Render logs.
+# httpx logs full request URLs at INFO, which would leak the bot token
+# (https://api.telegram.org/bot<TOKEN>/...) into the logs. Keep these quiet.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+
+
+# =====================================================================
+# FONTS (Unicode text styles; letters only, digits/emoji/punctuation stay plain)
+# Use ONLY on static text you write, never on user data (names, URLs, IDs).
+# =====================================================================
+def _make_map(upper_start: int, lower_start: int) -> dict:
+    m = {}
+    for i in range(26):
+        m[ord("A") + i] = chr(upper_start + i)
+        m[ord("a") + i] = chr(lower_start + i)
+    return m
+
+
+_SCRIPT = _make_map(0x1D4D0, 0x1D4EA)  # Mathematical Bold Script  -> 𝓗𝓮𝓵𝓵𝓸
+_SOFT = _make_map(0x1D63C, 0x1D656)    # Sans-Serif Bold Italic    -> 𝙃𝙚𝙡𝙡𝙤
+
+
+def script(text: str) -> str:
+    """Titles and headings."""
+    return text.translate(_SCRIPT)
+
+
+def soft(text: str) -> str:
+    """Labels and captions."""
+    return text.translate(_SOFT)
+
 
 # =====================================================================
 # CONFIG
@@ -95,7 +123,7 @@ async def api(endpoint: str, **params) -> dict:
 
 
 async def get_monitors(**params) -> dict:
-    """getMonitors with pagination (API returns max 50 per page)."""
+    """getMonitors with pagination (the API returns at most 50 per page)."""
     out: list = []
     offset = 0
     while True:
@@ -146,14 +174,14 @@ async def retry_tg(fn, *args, tries: int = 5, delay: float = 3, label: str = "",
         except NetworkError as e:  # includes TimedOut
             log.warning("%s attempt %d/%d failed: %s", label or "telegram call", i, tries, e)
             await asyncio.sleep(delay * i)
-        except Exception as e:  # Forbidden, BadRequest etc. -> no point retrying
+        except Exception as e:  # Forbidden, BadRequest... retrying will not help
             log.warning("%s failed: %s", label or "telegram call", e)
             return None
     return None
 
 
 async def send_html(bot, chat_id: int, text: str):
-    """Send long text safely (split on line boundaries, HTML mode)."""
+    """Send long text safely (split on line boundaries at 3800 chars, HTML mode)."""
     chunk = ""
     for line in text.split("\n"):
         if chunk and len(chunk) + len(line) + 1 > 3800:
@@ -172,13 +200,13 @@ async def send_html(bot, chat_id: int, text: str):
 async def text_monitors() -> str:
     data = await get_monitors()
     if data.get("stat") != "ok":
-        return f"❌ {esc(err(data))}"
+        return f"❌ Oops, something went wrong, love: {esc(err(data))}"
     if not data["monitors"]:
-        return "Koi monitor nahi hai. /add se add karo."
-    lines = ["<b>📡 Monitors</b>", ""]
+        return "No monitors yet, darling 🥺\nUse /add and give me something to watch over 💋"
+    lines = [f"<b>📡 {script('My Monitors')}</b>", ""]
     for m in data["monitors"]:
         lines.append(f"{STATUS.get(m['status'], m['status'])} <b>{esc(m['friendly_name'])}</b>")
-        lines.append(f"ID: <code>{m['id']}</code>")
+        lines.append(f"{soft('ID')}: <code>{m['id']}</code>")
         lines.append(f"{esc(m.get('url', ''))}")
         lines.append("")
     return "\n".join(lines)
@@ -187,31 +215,33 @@ async def text_monitors() -> str:
 async def text_status() -> str:
     data = await get_monitors()
     if data.get("stat") != "ok":
-        return f"❌ {esc(err(data))}"
+        return f"❌ Oops, something went wrong, love: {esc(err(data))}"
     ms = data["monitors"]
     up = sum(1 for m in ms if m["status"] == 2)
     paused = sum(1 for m in ms if m["status"] == 0)
     down = [m for m in ms if m["status"] in DOWN_STATES]
     lines = [
-        "<b>📈 Status</b>",
-        f"Total: {len(ms)}",
-        f"🟢 Up: {up}",
-        f"🔴 Down: {len(down)}",
-        f"⏸ Paused: {paused}",
+        f"<b>📈 {script('Status')}</b>",
+        f"{soft('Total')}: {len(ms)}",
+        f"🟢 {soft('Up')}: {up}",
+        f"🔴 {soft('Down')}: {len(down)}",
+        f"⏸ {soft('Paused')}: {paused}",
     ]
     if down:
         lines.append("")
-        lines.append("<b>Abhi down:</b>")
+        lines.append(f"<b>{soft('Down right now')}:</b>")
         for m in down:
             since = down_since.get(m["id"])
-            extra = f" ({fmt_dur(time.time() - since)} se)" if since else ""
+            extra = f" (for {fmt_dur(time.time() - since)})" if since else ""
             lines.append(f"• {esc(m['friendly_name'])}{extra}")
+        lines.append("\nDon't worry, baby, I'm keeping an eye on them 👀💋")
     else:
-        lines.append("\n✅ Sab kuch theek chal raha hai")
+        lines.append("\n✅ Everything is running perfectly, my love 💖")
     return "\n".join(lines)
 
 
 async def build_report(start: int, end: int, title: str) -> str:
+    """`title` may contain styled static text (script/soft); it is HTML-escaped here."""
     data = await get_monitors(
         logs=1,
         logs_start_date=start,
@@ -219,7 +249,7 @@ async def build_report(start: int, end: int, title: str) -> str:
         custom_uptime_ranges=f"{start}_{end}",
     )
     if data.get("stat") != "ok":
-        return f"❌ UptimeRobot error: {esc(err(data))}"
+        return f"❌ UptimeRobot error, love: {esc(err(data))}"
 
     wd = (end - start) > 86400  # show dates for reports longer than 1 day
     lines = [f"<b>📊 {esc(title)}</b>", ""]
@@ -229,20 +259,20 @@ async def build_report(start: int, end: int, title: str) -> str:
         downs = [l for l in m.get("logs", []) if l["type"] == 1]
         total_incidents += len(downs)
         lines.append(f"<b>{esc(m['friendly_name'])}</b> — {STATUS.get(m['status'], m['status'])}")
-        lines.append(f"Uptime: {esc(uptime)}%")
+        lines.append(f"{soft('Uptime')}: {esc(uptime)}%")
         if not downs:
-            lines.append("✅ Koi downtime nahi")
+            lines.append("✅ No downtime at all, I kept you safe 💕")
         for idx, l in enumerate(downs):
             began = l["datetime"]
             back = began + l["duration"]
             if idx == 0 and m["status"] in DOWN_STATES:
-                lines.append(f"🔴 {fmt_t(began, wd)} se down — abhi bhi down hai")
+                lines.append(f"🔴 Down since {fmt_t(began, wd)}, still down 🥺")
             else:
                 lines.append(
                     f"🔴 Down {fmt_t(began, wd)} → 🟢 Up {fmt_t(back, wd)} ({fmt_dur(l['duration'])})"
                 )
         lines.append("")
-    lines.append(f"Monitors: {len(data['monitors'])} | Incidents: {total_incidents}")
+    lines.append(f"{soft('Monitors')}: {len(data['monitors'])} | {soft('Incidents')}: {total_incidents}")
     return "\n".join(lines)
 
 
@@ -262,10 +292,10 @@ def menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def text_help() -> str:
-    lines = ["<b>🛠 Commands</b>", ""]
+    lines = [f"<b>🛠 {script('Commands')}</b>", ""]
     for name, desc in COMMANDS:
         lines.append(f"/{name} — {esc(desc)}")
-    lines += ["", "🔔 Auto: down/up alerts + daily report 12:00 AM"]
+    lines += ["", f"🔔 {soft('Auto')}: down/up alerts + a daily report at 12:00 AM 💌"]
     return "\n".join(lines)
 
 
@@ -289,13 +319,13 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 # COMMANDS (add new features below using @command)
 # =====================================================================
-@command("start", "Bot start + menu")
+@command("start", "Wake me up and open the menu 💋")
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (
-        "👑 <b>Welcome back, Owner!</b>\n\n"
-        "Main tumhara Uptime Guardian hoon.\n"
-        "Har monitor pe nazar hai — down hote hi alert, "
-        "aur roz 12:00 AM report. 🚀"
+        f"👑 <b>{script('Welcome back, my love')}</b>\n\n"
+        "I'm NOONA, your devoted Uptime Guardian 💋\n"
+        "I watch every monitor for you, I'll tell you the second one goes down, "
+        "and every night at 12:00 AM I'll send you a little report 💌"
     )
     chat_id = update.effective_chat.id
     try:
@@ -310,25 +340,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-@command("help", "Saare commands")
+@command("help", "Everything I can do for you 💕")
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, text_help())
 
 
-@command("status", "Quick summary (up/down/paused)")
+@command("status", "Quick summary: up, down, paused 💖")
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, await text_status())
 
 
-@command("monitors", "Saare monitors + ID")
+@command("monitors", "All your monitors and their IDs 📡")
 async def monitors_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(context.bot, update.effective_chat.id, await text_monitors())
 
 
-@command("add", "Monitor add: /add <name> <url>")
+@command("add", "Add a monitor: /add <name> <url> 💘")
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         return await update.message.reply_text(
+            "Tell me what to watch, darling 💋\n"
             "Use: /add <name> <url>\nEx: /add MyBot https://mybot.onrender.com"
         )
     url = context.args[-1]
@@ -337,56 +368,66 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args[:-1])
     data = await api("newMonitor", friendly_name=name, url=url, type=1, interval=300)
     if data.get("stat") == "ok":
-        await update.message.reply_text(f"✅ Added: {name}\nID: {data['monitor']['id']}")
+        await update.message.reply_text(
+            f"✅ Done, love! I'm watching {name} now 👀💕\nID: {data['monitor']['id']}"
+        )
     else:
-        await update.message.reply_text(f"❌ {err(data)}")
+        await update.message.reply_text(f"❌ Oops, something went wrong: {err(data)}")
 
 
-@command("remove", "Monitor delete: /remove <id>")
+@command("remove", "Delete a monitor: /remove <id> 🗑")
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
-        return await update.message.reply_text("Use: /remove <id>\nID /monitors se dekho.")
+        return await update.message.reply_text(
+            "Use: /remove <id>\nYou can find the ID with /monitors, baby 💋"
+        )
     data = await api("deleteMonitor", id=context.args[0])
-    await update.message.reply_text("🗑 Monitor removed." if data.get("stat") == "ok"
-                                    else f"❌ {err(data)}")
+    await update.message.reply_text(
+        "🗑 Gone, just like you asked, my love." if data.get("stat") == "ok"
+        else f"❌ Oops, something went wrong: {err(data)}"
+    )
 
 
-@command("pause", "Monitor pause: /pause <id>")
+@command("pause", "Pause a monitor: /pause <id> ⏸")
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
-        return await update.message.reply_text("Use: /pause <id>")
+        return await update.message.reply_text("Use: /pause <id> 💋")
     data = await api("editMonitor", id=context.args[0], status=0)
-    await update.message.reply_text("⏸ Paused." if data.get("stat") == "ok"
-                                    else f"❌ {err(data)}")
+    await update.message.reply_text(
+        "⏸ Paused, I'll rest my eyes for this one 😌" if data.get("stat") == "ok"
+        else f"❌ Oops, something went wrong: {err(data)}"
+    )
 
 
-@command("resume", "Monitor resume: /resume <id>")
+@command("resume", "Resume a monitor: /resume <id> ▶️")
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or not context.args[0].isdigit():
-        return await update.message.reply_text("Use: /resume <id>")
+        return await update.message.reply_text("Use: /resume <id> 💋")
     data = await api("editMonitor", id=context.args[0], status=1)
-    await update.message.reply_text("▶️ Resumed." if data.get("stat") == "ok"
-                                    else f"❌ {err(data)}")
+    await update.message.reply_text(
+        "▶️ Back on watch duty, my love 👀💕" if data.get("stat") == "ok"
+        else f"❌ Oops, something went wrong: {err(data)}"
+    )
 
 
-@command("report", "Report: /report [hours] (default 24)")
+@command("report", "Report: /report [hours], default 24 📊")
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours = 24
     if context.args and context.args[0].isdigit():
         hours = max(1, min(int(context.args[0]), 720))
     end = int(time.time())
-    text = await build_report(end - hours * 3600, end, f"Report — last {hours}h")
+    text = await build_report(end - hours * 3600, end, f"{script('Report')} — last {hours}h")
     await send_html(context.bot, update.effective_chat.id, text)
 
 
-@command("ping", "Bot + API speed check")
+@command("ping", "Check how fast I am for you 🏓")
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0 = time.perf_counter()
     data = await api("getAccountDetails")
     api_ms = int((time.perf_counter() - t0) * 1000)
     api_ok = "✅" if data.get("stat") == "ok" else "❌"
     await update.message.reply_text(
-        f"🏓 Pong!\nBot uptime: {fmt_dur(time.time() - START_TIME)}\n"
+        f"🏓 Pong, handsome!\nI've been awake for you: {fmt_dur(time.time() - START_TIME)}\n"
         f"UptimeRobot API: {api_ok} {api_ms} ms"
     )
 
@@ -406,7 +447,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await text_status()
     elif key == "m:report":
         end = int(time.time())
-        text = await build_report(end - 86400, end, "Report — last 24h")
+        text = await build_report(end - 86400, end, f"{script('Report')} — last 24h")
     elif key == "m:help":
         text = text_help()
     else:
@@ -418,11 +459,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BACKGROUND JOBS
 # =====================================================================
 async def startup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs once after start. Retries so Telegram timeouts on cold start don't matter."""
+    """Runs once after start. Retries so Telegram timeouts on a cold start don't matter."""
     ok = await retry_tg(
         context.bot.set_my_commands,
         [BotCommand(n, d[:250]) for n, d in COMMANDS],
-        scope=BotCommandScopeChat(OWNER_ID),  # menu only for owner
+        scope=BotCommandScopeChat(OWNER_ID),  # menu only for the owner
         label="set_my_commands",
     )
     if ok:
@@ -430,11 +471,11 @@ async def startup_job(context: ContextTypes.DEFAULT_TYPE):
     if NOTIFY_STARTUP:
         sent = await retry_tg(
             context.bot.send_message, OWNER_ID,
-            "✅ Bot online ho gaya (deploy/restart).",
+            "✅ I'm online and waiting for you, my love 💋 (deploy/restart)",
             label="startup notify",
         )
         if sent is None:
-            log.warning("Startup notify not delivered (owner ne /start nahi kiya ya network issue)")
+            log.warning("Startup notify not delivered (owner never sent /start, or network issue)")
 
 
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -461,16 +502,20 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
                 down_since[mid] = now
                 await context.bot.send_message(
                     OWNER_ID,
-                    f"🔴 <b>DOWN</b>: {name}\n{esc(m.get('url', ''))}\n🕒 {fmt_t(now)}",
+                    f"🔴 <b>{script('DOWN')}</b>: {name}\n"
+                    f"{esc(m.get('url', ''))}\n"
+                    f"🕒 {fmt_t(now)}\n"
+                    "Don't worry, love, I'm watching it closely 👀💋",
                     parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
                 )
             elif status == 2 and prev in DOWN_STATES:
                 started = down_since.pop(mid, now)
                 await context.bot.send_message(
                     OWNER_ID,
-                    f"🟢 <b>BACK UP</b>: {name}\n"
-                    f"⏱ Down tha: {fmt_dur(now - started)}\n"
-                    f"Offline {fmt_t(started)} → Online {fmt_t(now)}",
+                    f"🟢 <b>{script('BACK UP')}</b>: {name}\n"
+                    f"⏱ {soft('Was down for')}: {fmt_dur(now - started)}\n"
+                    f"{soft('Offline')} {fmt_t(started)} → {soft('Online')} {fmt_t(now)}\n"
+                    "All better now, my love 💖",
                     parse_mode=ParseMode.HTML,
                 )
         except Exception as e:  # one failed alert must not break the others
@@ -488,7 +533,7 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     end = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     start = end - 86400
     day = datetime.fromtimestamp(start, TZ).strftime("%d %b %Y")
-    text = await build_report(start, end, f"Daily Report ({day})")
+    text = await build_report(start, end, f"{script('Daily Report')} ({day})")
     try:
         await send_html(context.bot, OWNER_ID, text)
     except Exception as e:
@@ -531,14 +576,14 @@ async def post_init(app: Application):
 # MAIN
 # =====================================================================
 def main():
-    # Python 3.14 fix: main thread me default event loop nahi hota
+    # Python 3.14 fix: the main thread has no default event loop
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        # FIX: default timeouts are 5s -> "Timed out" on Render cold start
+        # default timeouts are 5s, which causes "Timed out" on a Render cold start
         .connect_timeout(20)
         .read_timeout(20)
         .write_timeout(20)
@@ -556,9 +601,12 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^m:"))
     app.add_error_handler(on_error)
 
-    app.job_queue.run_once(startup_job, when=3)
-    app.job_queue.run_repeating(check_job, interval=CHECK_EVERY, first=5)
-    app.job_queue.run_daily(daily_job, time=dtime(0, 0, tzinfo=TZ))
+    # misfire_grace_time: APScheduler skips jobs that start >1s late by default
+    app.job_queue.run_once(startup_job, when=3, job_kwargs={"misfire_grace_time": 120})
+    app.job_queue.run_repeating(check_job, interval=CHECK_EVERY, first=5,
+                                job_kwargs={"misfire_grace_time": 30})
+    app.job_queue.run_daily(daily_job, time=dtime(0, 0, tzinfo=TZ),
+                            job_kwargs={"misfire_grace_time": 600})
 
     app.run_polling(
         drop_pending_updates=True,
