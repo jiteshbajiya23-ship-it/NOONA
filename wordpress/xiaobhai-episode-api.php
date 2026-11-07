@@ -1,14 +1,15 @@
 <?php
 /**
  * Plugin Name: Xiao Bhai Episode API
- * Description: Token-protected endpoint so the Xiao Bhai Telegram bot can create episode posts (AnimeStream theme): series, category, video embeds and featured image.
- * Version:     1.1.0
+ * Description: Token-protected endpoint so the Xiao Bhai Telegram bot can create AND edit episode posts (AnimeStream theme): series, category, video embeds and featured image.
+ * Version:     1.2.0
  *
  * INSTALL (no wp-admin needed):
  *   Hostinger hPanel -> File Manager -> public_html/wp-content/ -> create the folder "mu-plugins"
  *   (if it is missing) -> upload this file into it. "Must-use" plugins load by themselves.
  *
- * The secret below must be the SAME as WP_BOT_TOKEN in the bot's environment variables.
+ * SECRET: best put  define('XB_BOT_TOKEN', 'your-long-random-secret');  in wp-config.php (never commit it to GitHub).
+ * It must be the SAME as WP_BOT_TOKEN in the bot's environment variables (20+ characters).
  */
 
 if (!defined('ABSPATH')) {
@@ -16,7 +17,7 @@ if (!defined('ABSPATH')) {
 }
 
 if (!defined('XB_BOT_TOKEN')) {
-    define('XB_BOT_TOKEN', '60d24aa9ff1fed891107c37f060fb5728c4e77b45ea1e862');
+    define('XB_BOT_TOKEN', 'CHANGE_ME'); // too short on purpose: the API stays locked until you set a real secret
 }
 
 final class XB_Episode_API
@@ -47,6 +48,13 @@ final class XB_Episode_API
         ));
         register_rest_route(self::NS, '/episode', array(
             'methods' => 'POST', 'callback' => array(__CLASS__, 'create_episode'), 'permission_callback' => $auth,
+        ));
+        register_rest_route(self::NS, '/posts', array(
+            'methods' => 'GET', 'callback' => array(__CLASS__, 'find_posts'), 'permission_callback' => $auth,
+        ));
+        register_rest_route(self::NS, '/post/(?P<id>\d+)', array(
+            array('methods' => 'GET', 'callback' => array(__CLASS__, 'get_post_info'), 'permission_callback' => $auth),
+            array('methods' => 'POST', 'callback' => array(__CLASS__, 'update_post'), 'permission_callback' => $auth),
         ));
     }
 
@@ -307,7 +315,7 @@ final class XB_Episode_API
         $theme = wp_get_theme();
         return self::out(array(
             'ok'     => true,
-            'plugin' => '1.1.0',
+            'plugin' => '1.2.0',
             'wp'     => get_bloginfo('version'),
             'php'    => PHP_VERSION,
             'theme'  => $theme ? $theme->get('Name') : '',
@@ -579,6 +587,271 @@ final class XB_Episode_API
             'embeds_saved' => (int) $prep['saved'], 'embeds_where' => $prep['where'], 'notes' => $prep['notes'],
             'image' => $image, 'image_error' => $image_error,
         ));
+    }
+
+    // ------------------------------------------------------------------ EDIT: find / read / update
+    private static function post_summary($p, $map)
+    {
+        $series_id = !empty($map['series_key']) ? (int) get_post_meta($p->ID, $map['series_key'], true) : 0;
+        $series    = $series_id ? get_post($series_id) : null;
+        return array(
+            'id'           => (int) $p->ID,
+            'title'        => wp_specialchars_decode($p->post_title),
+            'status'       => $p->post_status,
+            'episode'      => !empty($map['episode_key']) ? (int) get_post_meta($p->ID, $map['episode_key'], true) : 0,
+            'series_id'    => $series_id,
+            'series_title' => $series ? wp_specialchars_decode($series->post_title) : '',
+            'link'         => get_permalink($p->ID),
+            'edit_url'     => admin_url('post.php?post=' . $p->ID . '&action=edit'),
+        );
+    }
+
+    // Embeds as the bot understands them: [ ['host' => .., 'code' => '<iframe..'], ... ] (theme field + bot-written post text)
+    private static function read_embeds($p, $map)
+    {
+        $found = array();
+        if (!empty($map['embed_key']) && !empty($map['embed_shape'])) {
+            $raw   = get_post_meta($p->ID, $map['embed_key'], true);
+            $shape = $map['embed_shape'];
+            if ($shape === 'list' && is_array($raw) && !empty($map['embed_code_field'])) {
+                foreach ($raw as $row) {
+                    if (!is_array($row) || empty($row[$map['embed_code_field']])) {
+                        continue;
+                    }
+                    $host = (!empty($map['embed_host_field']) && isset($row[$map['embed_host_field']])) ? trim((string) $row[$map['embed_host_field']]) : '';
+                    $found[] = array('host' => self::clip($host !== '' ? $host : 'Server', 60), 'code' => (string) $row[$map['embed_code_field']]);
+                }
+            } elseif ($shape === 'assoc' && is_array($raw)) {
+                foreach ($raw as $k => $v) {
+                    if (is_string($v) && self::has_iframe($v)) {
+                        $found[] = array('host' => self::clip((string) $k, 60), 'code' => $v);
+                    }
+                }
+            } elseif ($shape === 'string' && self::has_iframe($raw)) {
+                $found[] = array('host' => 'Server', 'code' => (string) $raw);
+            }
+        }
+        if (preg_match_all('#<h3>(.*?)</h3>\s*(<iframe\b.*?</iframe>)#is', (string) $p->post_content, $m, PREG_SET_ORDER)) {
+            foreach ($m as $x) {
+                $found[] = array('host' => self::clip(trim(wp_strip_all_tags($x[1])), 60), 'code' => $x[2]);
+            }
+        }
+        return $found;
+    }
+
+    private static function id_list($raw)
+    {
+        $ids = array();
+        foreach ((array) $raw as $c) {
+            if ((int) $c > 0) {
+                $ids[] = (int) $c;
+            }
+        }
+        return $ids;
+    }
+
+    // ?search=text  |  ?slug=post-slug  |  ?series_id=12&episode=14   (newest first, max 8)
+    public static function find_posts($request)
+    {
+        $map  = self::map();
+        $args = array(
+            'post_type'      => 'post',
+            'post_status'    => array('publish', 'draft', 'pending', 'private', 'future'),
+            'posts_per_page' => 8,
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+            'no_found_rows'  => true,
+        );
+        $slug = sanitize_title((string) $request->get_param('slug'));
+        if ($slug !== '') {
+            $args['name'] = $slug;
+        }
+        $q = sanitize_text_field((string) $request->get_param('search'));
+        if ($q !== '') {
+            $args['s'] = $q;
+        }
+        $meta = array();
+        if (!empty($map['episode_key'])) {
+            $meta[] = array('key' => $map['episode_key'], 'compare' => 'EXISTS'); // episode posts only
+            $ep     = (int) $request->get_param('episode');
+            if ($ep > 0) {
+                $meta[] = array('key' => $map['episode_key'], 'value' => (string) $ep);
+            }
+        }
+        $sid = (int) $request->get_param('series_id');
+        if ($sid > 0 && !empty($map['series_key'])) {
+            $meta[] = array('key' => $map['series_key'], 'value' => (string) $sid);
+        }
+        if (!empty($meta)) {
+            $args['meta_query'] = array_merge(array('relation' => 'AND'), $meta);
+        }
+        $items = array();
+        foreach (get_posts($args) as $p) {
+            $items[] = self::post_summary($p, $map);
+        }
+        return self::out(array('ok' => true, 'items' => $items));
+    }
+
+    public static function get_post_info($request)
+    {
+        $id = (int) $request['id'];
+        $p  = get_post($id);
+        if (!$p || $p->post_type !== 'post') {
+            return new WP_Error('xb_no_post', 'Post not found.', array('status' => 404));
+        }
+        $map = self::map();
+        $out = self::post_summary($p, $map);
+        $cats = array();
+        foreach (wp_get_post_categories($id, array('fields' => 'all')) as $t) {
+            $cats[] = array('id' => (int) $t->term_id, 'title' => wp_specialchars_decode($t->name));
+        }
+        $out['categories'] = $cats;
+        $out['has_image']  = (bool) has_post_thumbnail($id);
+        $out['embeds']     = self::read_embeds($p, $map);
+        $out['ok']         = true;
+        $out['api']        = 3;
+        return self::out($out);
+    }
+
+    // Send only the fields you want to change: title, status, episode, series_id, category_ids,
+    // embeds (the FULL new list; [] removes all), featured_image_url (+ image_title).
+    public static function update_post($request)
+    {
+        $map = self::map();
+        if (empty($map['episode_key']) || empty($map['series_key']) || empty($map['sub_key'])) {
+            return new WP_Error('xb_not_calibrated', 'Field names not learned yet. Run /wpcheck in the bot first.', array('status' => 409));
+        }
+        $id = (int) $request['id'];
+        $p  = get_post($id);
+        if (!$p || $p->post_type !== 'post') {
+            return new WP_Error('xb_no_post', 'Post not found.', array('status' => 404));
+        }
+
+        $args    = array('ID' => $id);
+        $changed = array();
+        $notes   = array();
+
+        if ($request->has_param('title')) {
+            $title = trim(wp_strip_all_tags((string) $request->get_param('title')));
+            if ($title === '' || strlen($title) > 250) {
+                return new WP_Error('xb_bad_title', 'Title is empty or too long.', array('status' => 400));
+            }
+            $args['post_title'] = wp_slash($title);
+            $changed[]          = 'title';
+        }
+        if ($request->has_param('status')) {
+            $st = (string) $request->get_param('status');
+            if (in_array($st, array('publish', 'draft'), true)) {
+                $args['post_status'] = $st;
+                $changed[]           = 'status';
+            }
+        }
+        if ($request->has_param('category_ids')) {
+            $cats = self::id_list($request->get_param('category_ids'));
+            if (!empty($cats)) {
+                $args['post_category'] = $cats;
+                $changed[]             = 'category';
+            }
+        }
+
+        $cur_series = (int) get_post_meta($id, $map['series_key'], true);
+        $cur_ep     = (int) get_post_meta($id, $map['episode_key'], true);
+        $new_series = $cur_series;
+        $new_ep     = $cur_ep;
+        if ($request->has_param('series_id')) {
+            $new_series = (int) $request->get_param('series_id');
+            if ($new_series < 1 || !get_post($new_series)) {
+                return new WP_Error('xb_bad_series', 'That series does not exist on the website.', array('status' => 400));
+            }
+        }
+        if ($request->has_param('episode')) {
+            $new_ep = (int) $request->get_param('episode');
+            if ($new_ep < 1) {
+                return new WP_Error('xb_bad_episode', 'Episode number is missing.', array('status' => 400));
+            }
+        }
+        if ($new_series !== $cur_series || $new_ep !== $cur_ep) {
+            $dupe = get_posts(array(
+                'post_type' => 'post', 'post_status' => 'any', 'posts_per_page' => 1, 'fields' => 'ids',
+                'no_found_rows' => true, 'post__not_in' => array($id),
+                'meta_query' => array(
+                    'relation' => 'AND',
+                    array('key' => $map['series_key'], 'value' => (string) $new_series),
+                    array('key' => $map['episode_key'], 'value' => (string) $new_ep),
+                ),
+            ));
+            if (!empty($dupe)) {
+                return new WP_Error('xb_duplicate', 'Another post already has that series + episode number.', array('status' => 409));
+            }
+            if ($new_ep !== $cur_ep) {
+                $changed[] = 'episode';
+            }
+            if ($new_series !== $cur_series) {
+                $changed[] = 'series';
+            }
+        }
+
+        // Act as the site's administrator so WordPress does not strip the <iframe> from the post text.
+        wp_set_current_user(self::author_id());
+
+        $prep = null;
+        if ($request->has_param('embeds')) {
+            $embeds = self::clean_embeds($request->get_param('embeds'));
+            $prep   = self::prepare_embeds($embeds, $map);
+            if (empty($embeds) && !empty($map['embed_key'])) {
+                $prep['meta'][$map['embed_key']] = (isset($map['embed_shape']) && $map['embed_shape'] === 'string') ? '' : array();
+            }
+            // bot-written blocks (<h3>Host</h3><iframe>) are replaced; anything else in the post text stays
+            $kept = preg_replace('#<h3>.*?</h3>\s*<iframe\b.*?</iframe>\s*#is', '', (string) $p->post_content);
+            $args['post_content'] = wp_slash(rtrim((string) $kept) . ($prep['content'] !== '' ? "\n\n" . $prep['content'] : ''));
+            $changed[] = 'embeds';
+            foreach ($prep['notes'] as $n) {
+                $notes[] = $n;
+            }
+        }
+
+        if (count($args) > 1) {
+            $res = wp_update_post($args, true);
+            if (is_wp_error($res)) {
+                return $res;
+            }
+        }
+
+        // Custom fields AFTER the update, so nothing the theme does on save_post can overwrite them.
+        if ($new_ep !== $cur_ep) {
+            update_post_meta($id, $map['episode_key'], (string) $new_ep);
+        }
+        if ($new_series !== $cur_series) {
+            update_post_meta($id, $map['series_key'], (string) $new_series);
+        }
+        if ($prep !== null) {
+            foreach ($prep['meta'] as $k => $v) {
+                update_post_meta($id, $k, wp_slash($v));
+            }
+        }
+
+        $image       = '';
+        $image_error = '';
+        $image_url   = trim((string) $request->get_param('featured_image_url'));
+        if ($image_url !== '') {
+            $ttl = trim(wp_strip_all_tags((string) $request->get_param('image_title')));
+            $att = self::attach_image($id, $image_url, $ttl !== '' ? $ttl : (string) get_the_title($id));
+            if (is_wp_error($att)) {
+                $image       = 'failed';
+                $image_error = $att->get_error_message();
+            } else {
+                $image     = 'ok';
+                $changed[] = 'image';
+            }
+        }
+
+        $out = self::post_summary(get_post($id), $map);
+        $out += array(
+            'ok' => true, 'api' => 3, 'changed' => $changed, 'notes' => $notes,
+            'image' => $image, 'image_error' => $image_error,
+            'embeds_saved' => $prep ? (int) $prep['saved'] : null,
+        );
+        return self::out($out);
     }
 }
 
