@@ -1,8 +1,8 @@
 # 💋 NOONA
 
-> Your devoted Uptime Guardian. She watches your websites, whispers when something goes down, and sends you a little report every night. 🌙
+> Your devoted guardian. She watches your websites, whispers when something goes down, posts your episodes, and sends you a little report every night. 🌙
 
-NOONA is an **owner-only Telegram bot** that connects to [UptimeRobot](https://uptimerobot.com), alerts you when a monitor goes down or comes back up, and sends a daily report. She is flirty, romantic, and completely loyal to her owner. 💞
+NOONA is an **owner-only Telegram bot**. She connects to [UptimeRobot](https://uptimerobot.com) to alert you when a monitor goes down or comes back up, and to your **WordPress site** so you can create and edit episode posts from chat, all with buttons. She is flirty, romantic, and completely loyal to her owner. 💞
 
 ---
 
@@ -11,6 +11,10 @@ NOONA is an **owner-only Telegram bot** that connects to [UptimeRobot](https://u
 - 🔔 **Instant alerts** when a monitor goes down or recovers
 - 📊 **Daily report** at 12:00 AM (your timezone)
 - 📡 **Manage monitors** from chat: add, remove, pause, resume
+- 🕹 **Interactive buttons**: menu, alert buttons (🔎 Check now · ⏸ Pause it · 💖 Got it), and a button flow for every post
+- 📝 **Website posts**: series, category, episode, embeds and TMDB poster, all picked with taps
+- ✏️ **Edit old posts**: change the title, episode, embeds, poster, category, or publish/draft status any time
+- ⏭ **Next episode** button: same series, category and poster, episode + 1, in one tap
 - 🔐 **Owner-only**: anyone else gets politely rejected 😘
 - 💓 **Health endpoint** (`/health`) so UptimeRobot can keep her awake on Render
 - 🎨 **Pretty UI** with emojis, dividers, and two Unicode font styles (script for titles, bold italic for labels)
@@ -32,8 +36,9 @@ NOONA is an **owner-only Telegram bot** that connects to [UptimeRobot](https://u
 | `/report [hours]` | Report for the last N hours (default 24, max 720) 📊 |
 | `/ping` | Check bot uptime and API speed 🏓 |
 | `/wp [name]` | Create a website episode post (series, category, episode, embeds, featured image) 📝 |
+| `/edit [link, id or name]` | Edit an old post. Examples: `/edit Soul Land 2 ep 14`, `/edit 1234`, `/edit https://site/post/` ✏️ |
 | `/wpcheck` | Test the connection to the website plugin 🔌 |
-| `/cancel` | Stop the current `/wp` flow ✖️ |
+| `/cancel` | Stop the current `/wp` or `/edit` flow ✖️ |
 
 ---
 
@@ -44,6 +49,10 @@ NOONA is an **owner-only Telegram bot** that connects to [UptimeRobot](https://u
 - **Bot token**: create a bot with [@BotFather](https://t.me/BotFather)
 - **UptimeRobot API key**: UptimeRobot dashboard → Integrations → API (use the **main** API key)
 - **Your Telegram user ID**: message [@userinfobot](https://t.me/userinfobot)
+- **TMDB API key** (optional, for posters): themoviedb.org → Settings → API
+- **Website secret** (optional, for posting/editing): any random string of 20+ characters you make up yourself
+
+> ℹ️ NOONA is a normal **bot**, so she needs **no Telegram `api_id` / `api_hash`**. Those are only for user-account libraries (Telethon, Pyrogram), which this project does not use.
 
 ### 2. Install 📦
 
@@ -72,7 +81,14 @@ pip install -r requirements.txt
 | `TMDB_API_KEY` | ➖ | n/a | Needed for the featured-image step of `/wp` (v3 key or v4 token) |
 | `WP_IMAGE_SIZE` | ➖ | `w780` | TMDB size of the featured image: `w500`, `w780`, `original` |
 
-**Website posting setup (one time):** put your secret in `wordpress/xiaobhai-episode-api.php` (`define('XB_BOT_TOKEN', '...')`), upload that file to `wp-content/mu-plugins/` on the site, set `WP_BOT_TOKEN` to the same secret, redeploy, then send `/wpcheck`. Logic lives in `wp.py`.
+**Website setup (one time, and again after every plugin update):**
+
+1. Make up a long random secret (20+ characters).
+2. Add this line to `wp-config.php` on the site: `define('XB_BOT_TOKEN', 'your-secret');`
+   (the plugin ships with the placeholder `CHANGE_ME`, so it stays **locked** until you do this. Never commit the real secret to GitHub.)
+3. Upload `wordpress/xiaobhai-episode-api.php` (**version 1.2**, needed for `/edit`) to `wp-content/mu-plugins/`.
+4. Set `WP_BOT_TOKEN` to the same secret in Render and redeploy.
+5. Send `/wpcheck`. Logic lives in `wp.py`.
 
 ### 4. Run ▶️
 
@@ -113,7 +129,10 @@ async def hello_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 | File | Purpose |
 |---|---|
-| `bot.py` | The whole bot |
+| `bot.py` | Monitoring, alerts, reports, menu |
+| `wp.py` | Website posting and editing (`/wp`, `/edit`, `/wpcheck`) |
+| `ui.py` | The two fonts and the romantic persona lines |
+| `wordpress/xiaobhai-episode-api.php` | WordPress plugin (upload to `mu-plugins/`) |
 | `requirements.txt` | Python dependencies |
 | `PROJECT.md` | Technical documentation |
 | `README.md` | You are here 💞 |

@@ -2,14 +2,15 @@
 NOONA add-on: website posting (WordPress). Owner-only, one self-contained file.
 
 Commands : /wp [name]  - create an episode post step by step
+           /edit [x]   - edit an OLD post (title, episode, embeds, poster, category, publish/draft)
            /wpcheck    - test the connection to the website plugin
-           /cancel     - stop the /wp flow
+           /cancel     - stop the current /wp or /edit flow
 Flow     : name -> series -> category -> episode -> embeds -> featured image (TMDB) -> post
 
 Install  : see the 3-line change in bot.py (import wp / wp.setup(app, COMMANDS) / await wp.close()).
 Env vars : WP_BOT_TOKEN (required)  WP_URL  WP_POST_STATUS  WP_REFERENCE_URL
            TMDB_API_KEY  TMDB_LANGUAGE  WP_IMAGE_SIZE  IMPERSONATE
-Server   : wordpress/xiaobhai-episode-api.php must sit in wp-content/mu-plugins/ on the website.
+Server   : wordpress/xiaobhai-episode-api.php (v1.2+) must sit in wp-content/mu-plugins/ on the website.
 """
 from __future__ import annotations
 
@@ -40,6 +41,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from ui import DIV, cancelled, done, head, oops, script, soft, wait
 
 log = logging.getLogger("wp")
 
@@ -263,6 +266,21 @@ class WordPress:
             body["image_title"] = image_title or title
         return await self._call("POST", "/episode", body=body)
 
+    # ---- editing old posts (plugin 1.2+) ----
+    async def posts(self, *, search: str = "", slug: str = "", episode: int = 0, series_id: int = 0) -> list[dict]:
+        params = {k: v for k, v in (("search", search), ("slug", slug),
+                                    ("episode", episode or ""), ("series_id", series_id or "")) if v}
+        return (await self._call("GET", "/posts", params)).get("items") or []
+
+    async def get_post(self, post_id: int) -> dict:
+        return await self._call("GET", f"/post/{int(post_id)}")
+
+    async def update_post(self, post_id: int, **fields) -> dict:
+        """Send only what changes: title, status, episode, series_id, category_ids, embeds (full list),
+        featured_image_url, image_title."""
+        body = {k: v for k, v in fields.items() if v is not None}
+        return await self._call("POST", f"/post/{int(post_id)}", body=body)
+
 
 wp = WordPress()
 
@@ -294,6 +312,7 @@ def parse_tv_id(text: str) -> int | None:
 class TMDB:
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
+        self._posters: dict[int, tuple[float, list]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -344,10 +363,14 @@ class TMDB:
         return await self._get(f"/tv/{int(tv_id)}")
 
     async def all_posters(self, tv_id: int) -> list[dict]:
+        hit = self._posters.get(int(tv_id))
+        if hit and time.monotonic() - hit[0] < 3600:  # cached for 1 hour
+            return list(hit[1])
         data = await self._get(f"/tv/{int(tv_id)}/images", language=None)
         posters = [p for p in (data.get("posters") or []) if p.get("file_path")]
         posters.sort(key=lambda p: (-(p.get("vote_average") or 0), -(p.get("vote_count") or 0)))
-        return posters
+        self._posters[int(tv_id)] = (time.monotonic(), posters)
+        return list(posters)
 
 
 tmdb = TMDB()
@@ -382,11 +405,14 @@ class Flow:
 
 
 _flows: dict[int, Flow] = {}
+_edits: dict[int, "Edit"] = {}   # open /edit sessions (see EDIT AN OLD POST)
+_last: dict[int, dict] = {}      # last created post per owner, powers the "Next episode" button
 TEXT_STEPS = {"name", "series_q", "cat_q", "episode", "emb_host", "emb_code", "tmdb_q"}
 
 
 def flow_start(user_id: int, name: str = "") -> Flow:
     flow = Flow(user_id=user_id, name=(name or "").strip())
+    _edits.pop(user_id, None)  # one open flow at a time
     _flows[user_id] = flow
     return flow
 
@@ -400,7 +426,9 @@ def flow_get(user_id: int) -> Flow | None:
 
 
 def flow_drop(user_id: int) -> bool:
-    return _flows.pop(user_id, None) is not None
+    a = _flows.pop(user_id, None) is not None
+    b = _edits.pop(user_id, None) is not None
+    return a or b
 
 
 # =====================================================================
@@ -440,21 +468,27 @@ def rank_items(items: list[dict], query: str, limit: int = 8) -> list[dict]:
     return sorted(items, key=lambda it: -score(it))[:limit]
 
 
-async def find_series(name: str) -> list[dict]:
+async def _gather_items(calls) -> dict[int, dict]:
+    """Run several website searches at once; fail only if ALL of them fail."""
+    results = await asyncio.gather(*calls, return_exceptions=True)
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors and len(errors) == len(results):
+        raise errors[0]
     seen: dict[int, dict] = {}
-    for q in search_terms(name)[:3]:
-        for it in await wp.series(q):
-            seen.setdefault(int(it["id"]), it)
-        if len(seen) >= 8:
-            break
+    for r in results:
+        if not isinstance(r, Exception):
+            for it in r:
+                seen.setdefault(int(it["id"]), it)
+    return seen
+
+
+async def find_series(name: str) -> list[dict]:
+    seen = await _gather_items([wp.series(q) for q in search_terms(name)[:3]])
     return rank_items(list(seen.values()), name)
 
 
 async def find_categories(name: str) -> list[dict]:
-    seen: dict[int, dict] = {}
-    for q in search_terms(name)[:3]:
-        for it in await wp.categories(q):
-            seen.setdefault(int(it["id"]), it)
+    seen = await _gather_items([wp.categories(q) for q in search_terms(name)[:3]]) if name else {}
     items = rank_items(list(seen.values()), name) if seen else []
     return items or (await wp.categories(""))[:8]
 
@@ -479,13 +513,17 @@ def clean_host(text: str | None) -> str:
     return " ".join((text or "").split())[:40]
 
 
-def embeds_text(flow: Flow) -> str:
-    if not flow.embeds:
-        return "🎬 <b>Embeds</b>: none"
-    lines = [f"🎬 <b>Embeds</b> ({len(flow.embeds)})"]
-    for i, e in enumerate(flow.embeds, 1):
+def embeds_block(embeds: list) -> str:
+    if not embeds:
+        return f"🎬 <b>{soft('Embeds')}</b>: none"
+    lines = [f"🎬 <b>{soft('Embeds')}</b> ({len(embeds)})"]
+    for i, e in enumerate(embeds, 1):
         lines.append(f"\n<b>{i}. {esc(e['host'])}</b>\n<pre>{esc(short(e['code'], 220))}</pre>")
     return "\n".join(lines)
+
+
+def embeds_text(flow: Flow) -> str:
+    return embeds_block(flow.embeds)
 
 
 # ---- TMDB show + posters ----
@@ -584,13 +622,17 @@ def emb_next_rows(flow: Flow) -> list:
     return rows
 
 
-NAME_PROMPT = ("📝 <b>New website post</b>\n"
-               "Send the post name, for example <code>Soul Land 2</code>.\n"
-               "The title becomes <i>name + Episode N English Subtitles</i>, so write the season in the name "
-               "if you want it in the title.\n\n/cancel to stop.")
+NAME_PROMPT = (f"{head('📝', 'New Website Post')}\n{DIV}\n"
+               "Tell me the post name, love, for example <code>Soul Land 2</code> 💕\n"
+               "The title becomes <i>name + Episode N English Subtitles</i>, so put the season in the name "
+               "if you want it in the title.\n\n/cancel to stop 💋")
 
-NOT_ENABLED = ("⚠️ Website posting is off. Set <code>WP_BOT_TOKEN</code> (the secret inside "
-               "<code>xiaobhai-episode-api.php</code>) in your environment variables and redeploy.")
+EDIT_PROMPT = (f"{head('✏️', 'Edit A Post')}\n{DIV}\n"
+               "Send me the <b>post link</b>, the <b>post ID</b>, or part of its name, "
+               "for example <code>Soul Land 2 ep 14</code> 💕\n\nOr tap <b>Latest posts</b> 👇")
+
+NOT_ENABLED = ("⚠️ Website posting is off, my love. Set <code>WP_BOT_TOKEN</code> (the secret inside "
+               "<code>xiaobhai-episode-api.php</code>) in your environment variables and redeploy 💋")
 
 
 def post_title(flow: Flow) -> str:
@@ -607,12 +649,13 @@ async def create_post(flow: Flow) -> dict:
 
 def result_text(flow: Flow, res: dict) -> tuple[str, list | None]:
     if res.get("exists"):
-        head = "ℹ️ <b>This episode is already on the website</b> (nothing was changed)"
+        head_txt = (f"ℹ️ <b>{script('Already There')}</b>\n"
+                    "This episode is already on the website, love. I changed nothing 💕")
     elif res.get("status") == "draft":
-        head = "📝 <b>Website draft created</b>"
+        head_txt = f"📝 <b>{script('Draft Saved')}</b>\n{done()}"
     else:
-        head = "✅ <b>Website post published</b>"
-    lines = [head, esc(post_title(flow)),
+        head_txt = f"✅ <b>{script('Published')}</b>\n{done()}"
+    lines = [head_txt, DIV, f"<b>{esc(post_title(flow))}</b>",
              f"📚 {esc(flow.series_title)} · 🏷 {esc(flow.cat_title) if flow.cat_id else 'no category'}"]
     if not res.get("exists"):
         if flow.embeds:
@@ -635,11 +678,19 @@ def result_text(flow: Flow, res: dict) -> tuple[str, list | None]:
         for note in res.get("notes") or []:
             lines.append(f"ℹ️ {esc(short(note, 200))}")
     rows = []
-    if res.get("edit_url"):
-        rows.append([("✏️ Edit post", "url", res["edit_url"])])
+    action_row = []
+    if res.get("id"):
+        action_row.append(("✏️ Edit this post", "cb", f"ed:open:{res['id']}"))
+    action_row.append(("⏭ Next episode", "cb", "wp:next"))
+    rows.append(action_row)
+    links = []
     if res.get("link") and res.get("status") == "publish":
-        rows.append([("🔗 Open post", "url", res["link"])])
-    return "\n".join(lines), rows or None
+        links.append(("🔗 Open post", "url", res["link"]))
+    if res.get("edit_url"):
+        links.append(("🛠 WP editor", "url", res["edit_url"]))
+    if links:
+        rows.append(links)
+    return "\n".join(lines), rows
 
 
 # =====================================================================
@@ -647,21 +698,21 @@ def result_text(flow: Flow, res: dict) -> tuple[str, list | None]:
 # =====================================================================
 async def _ask_series(msg, flow: Flow, query: str | None = None) -> None:
     q = query or flow.name
-    note = await msg.reply_text("🔎 Looking for the series on the website…")
+    note = await msg.reply_text("🔎 Searching the website for your series, love…")
     try:
         items = await find_series(q)
     except WPError as exc:
         flow.step = "series_q"
-        await _edit(note, f"⚠️ Website problem: <code>{esc(str(exc)[:300])}</code>\n"
-                          "Send a name to try again, or /cancel. Check the connection with /wpcheck.")
+        await _edit(note, f"💔 Website problem: <code>{esc(str(exc)[:300])}</code>\n"
+                          "Send a name to try again, or /cancel. Check the connection with /wpcheck 💋")
         return
     if not items:
         flow.step = "series_q"
-        await _edit(note, f"No series on the website matches <b>{esc(q)}</b>.\n"
+        await _edit(note, f"I couldn't find a series called <b>{esc(q)}</b>, baby 🥺\n"
                           "Send the name as written on the site, or /cancel.")
         return
     flow.series, flow.step = items, "series"
-    await _edit(note, f"📚 Which <b>series</b> on the website is <b>{esc(flow.name)}</b>?", series_rows(flow))
+    await _edit(note, f"📚 Which <b>{soft('series')}</b> is <b>{esc(flow.name)}</b>, darling?", series_rows(flow))
 
 
 async def _ask_category(msg, flow: Flow, query: str | None = None) -> None:
@@ -674,15 +725,19 @@ async def _ask_category(msg, flow: Flow, query: str | None = None) -> None:
                           "Send a category name to try again, or /cancel.")
         return
     flow.cats, flow.step = items, "cat"
-    await _edit(note, "🏷 Which <b>category</b> should the post get?", cat_rows(flow))
+    await _edit(note, f"🏷 Which <b>{soft('category')}</b> should it go in, love?", cat_rows(flow))
 
 
 async def _ask_embeds(msg, flow: Flow) -> None:
     flow.step = "emb_ask"
-    await _reply(msg, "🎬 Add a <b>video embed</b>?", EMB_ASK_ROWS)
+    await _reply(msg, f"🎬 Shall we add a <b>{soft('video embed')}</b>, my love?", EMB_ASK_ROWS)
 
 
 async def _ask_image(msg, flow: Flow) -> None:
+    if flow.image_path:  # "Next episode": same show, same poster
+        await msg.reply_text("🖼 Using the same poster as last time 💞")
+        await _finish(msg, flow)
+        return
     if not tmdb.enabled:
         await _finish(msg, flow)
         return
@@ -715,16 +770,22 @@ async def _show_image(msg, flow: Flow, found: bool) -> None:
 
 async def _finish(msg, flow: Flow) -> None:
     flow.step = "creating"
-    note = await msg.reply_text("⏳ Creating the post…")
+    note = await msg.reply_text(f"⏳ {wait()}")
     try:
         res = await create_post(flow)
     except Exception as exc:
         flow.step = "final"
-        await _edit(note, "⚠️ <b>The post was not created</b>\n" + f"<code>{esc(str(exc)[:400])}</code>",
+        await _edit(note, f"💔 <b>{script('Not Created')}</b>\n{oops()}\n" + f"<code>{esc(str(exc)[:400])}</code>",
                     [[("🔁 Retry", "cb", "wp:retry"), ("✖️ Cancel", "cb", "wp:x")]])
         log.warning("Website post failed: %s", exc)
         return
     flow_drop(flow.user_id)
+    if not res.get("exists"):
+        _last[flow.user_id] = {
+            "name": flow.name, "series_id": flow.series_id, "series_title": flow.series_title,
+            "cat_id": flow.cat_id, "cat_title": flow.cat_title, "episode": flow.episode,
+            "image_path": flow.image_path, "tmdb_id": flow.tmdb_id, "tmdb_name": flow.tmdb_name,
+        }
     text, rows = result_text(flow, res)
     await _edit(note, text, rows)
 
@@ -732,32 +793,41 @@ async def _finish(msg, flow: Flow) -> None:
 # =====================================================================
 # HANDLERS
 # =====================================================================
-async def wp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_new(msg, uid: int, name: str = "") -> None:
+    """Start the /wp flow (used by the command and by the menu button)."""
     if not wp.enabled:
-        return await _reply(update.message, NOT_ENABLED)
-    name = " ".join(context.args or []).strip()
-    flow = flow_start(update.effective_user.id, name)
+        return await _reply(msg, NOT_ENABLED)
+    flow = flow_start(uid, name)
     if name:
-        await _ask_series(update.message, flow)
+        await _ask_series(msg, flow)
     else:
-        await _reply(update.message, NAME_PROMPT)
+        await _reply(msg, NAME_PROMPT)
+
+
+async def wp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_new(update.message, update.effective_user.id, " ".join(context.args or []).strip())
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    done = flow_drop(update.effective_user.id)
-    await update.message.reply_text("✖️ Cancelled." if done else "Nothing to cancel.")
+    was_open = flow_drop(update.effective_user.id)
+    await update.message.reply_text(f"✖️ {cancelled()}" if was_open else "There's nothing to cancel, love 💕")
 
 
 class _InFlow(filters.MessageFilter):
     """True when the owner is in the middle of /wp and the next plain text belongs to it."""
     def filter(self, message) -> bool:
         user = message.from_user
-        flow = flow_get(user.id) if user else None
-        return bool(flow and flow.step in TEXT_STEPS)
+        if not user:
+            return False
+        flow, ed = flow_get(user.id), edit_get(user.id)
+        return bool((flow and flow.step in TEXT_STEPS) or (ed and ed.step in EDIT_TEXT_STEPS))
 
 
 async def flow_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+    ed = edit_get(update.effective_user.id)
+    if ed and ed.step in EDIT_TEXT_STEPS:
+        return await edit_text(update, context)
     flow = flow_get(update.effective_user.id)
     if not flow:
         return
@@ -776,7 +846,7 @@ async def flow_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = re.search(r"\d+", text)
         ep = int(m.group()) if m else 0
         if not 1 <= ep <= 9999:
-            return await _reply(message, "Send the episode <b>number</b>, for example <code>14</code>.")
+            return await _reply(message, "Send the episode <b>number</b>, love, for example <code>14</code> 💕")
         flow.episode = ep
         await _ask_embeds(message, flow)
     elif step == "emb_host":
@@ -803,6 +873,22 @@ async def flow_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_image(message, flow, found)
 
 
+async def _next_episode(cq, msg, uid: int) -> None:
+    """One tap: same series, category and poster, episode + 1, straight to the embeds."""
+    last = _last.get(uid)
+    if not last:
+        return await cq.answer("I lost track of the last post, love. Send /wp 💋", show_alert=True)
+    await cq.answer()
+    flow = flow_start(uid, last["name"])
+    flow.series_id, flow.series_title = last["series_id"], last["series_title"]
+    flow.cat_id, flow.cat_title = last["cat_id"], last["cat_title"]
+    flow.episode = int(last["episode"]) + 1
+    flow.image_path, flow.tmdb_id, flow.tmdb_name = last["image_path"], last["tmdb_id"], last["tmdb_name"]
+    flow.step = "emb_ask"
+    await _reply(msg, f"⏭ <b>{esc(post_title(flow))}</b>\n📚 {esc(flow.series_title)}\n\n"
+                      f"🎬 Shall we add a <b>{soft('video embed')}</b>, my love?", EMB_ASK_ROWS)
+
+
 async def flow_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     parts = cq.data.split(":")
@@ -812,8 +898,10 @@ async def flow_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "x":
         flow_drop(uid)
-        await _edit(msg, "✖️ Cancelled.")
+        await _edit(msg, f"✖️ {cancelled()}")
         return await cq.answer()
+    if action == "next":
+        return await _next_episode(cq, msg, uid)
     flow = flow_get(uid)
     if not flow:
         return await cq.answer("This post is no longer open. Send /wp to start again.", show_alert=True)
@@ -843,7 +931,7 @@ async def flow_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _edit(msg, f"🏷 Category: <b>{esc(flow.cat_title) if flow.cat_id else 'none'}</b>")
         await cq.answer()
         flow.step = "episode"
-        await _reply(msg, "🔢 Send the <b>episode number</b>.")
+        await _reply(msg, f"🔢 Which <b>{soft('episode number')}</b>, handsome?")
     elif action == "cq" and step == "cat":
         flow.step = "cat_q"
         await _edit(msg, "🔎 Send a category name to search.")
@@ -936,7 +1024,7 @@ async def wpcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Send this to your developer/Claude:\n<pre>{esc(dump)}</pre>")
     m = cal["map"]
     plugin = str(info.get("plugin") or "1.0.0")
-    new_plugin = _version(plugin) >= (1, 1)
+    new_plugin = _version(plugin) >= (1, 2)
     if m.get("embed_key"):
         embed_line = f"• Embeds → <code>{esc(m['embed_key'])}</code> ({esc(m.get('embed_shape'))})"
     else:
@@ -954,7 +1042,421 @@ async def wpcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{embed_line}\n\n"
         f"New posts are created as: <b>{WP_POST_STATUS}</b>"
         + ("" if new_plugin else "\n\n⚠️ The plugin on the website is <b>old</b>: upload the new "
-           "<code>xiaobhai-episode-api.php</code> (embeds and featured image need it)."))
+           "<code>xiaobhai-episode-api.php</code> (embeds, featured image and /edit need version 1.2)."))
+
+
+# =====================================================================
+# EDIT AN OLD POST  (/edit, needs plugin 1.2+)
+# =====================================================================
+@dataclass
+class Edit:
+    user_id: int
+    step: str = "find"          # find | pick | card | title | episode | emb_host | emb_code | cat_q | tmdb_q ...
+    results: list = field(default_factory=list)
+    post: dict = field(default_factory=dict)   # last copy of the post, as the website reports it
+    host: str = ""
+    idx: int = -1               # embed being replaced (-1 = adding a new one)
+    cats: list = field(default_factory=list)
+    fl: Flow | None = None      # poster picker state (reuses the /wp poster helpers)
+    ts: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.ts = time.monotonic()
+
+
+EDIT_TEXT_STEPS = {"find", "pick", "title", "episode", "emb_host", "emb_code", "cat_q", "tmdb_q"}
+_EP = re.compile(r"(?:\bep(?:isode)?\.?\s*|\be)(\d{1,4})\b", re.I)
+
+
+def edit_start(user_id: int) -> Edit:
+    _flows.pop(user_id, None)  # one open flow at a time
+    ed = Edit(user_id=user_id)
+    _edits[user_id] = ed
+    return ed
+
+
+def edit_get(user_id: int) -> Edit | None:
+    ed = _edits.get(user_id)
+    if ed and time.monotonic() - ed.ts > TTL:
+        _edits.pop(user_id, None)
+        return None
+    return ed
+
+
+async def _send(msg, text: str, rows=None):
+    """New message in the same chat (works even if `msg` was deleted)."""
+    return await msg.chat.send_message(text, parse_mode=HTML, reply_markup=markup(rows),
+                                       link_preview_options=NO_PREVIEW)
+
+
+def _hint(text: str) -> str:
+    low = text.lower()
+    if "no route" in low or "rest_no_route" in low:
+        return "The website plugin is old. Upload the new xiaobhai-episode-api.php (v1.2) and send /wpcheck."
+    return short(text, 300)
+
+
+async def find_posts(query: str) -> list[dict]:
+    """Post link, post ID, 'name ep 14', or nothing (= latest posts)."""
+    q = (query or "").strip()
+    if not q or q.lower() == "latest":
+        return await wp.posts()
+    if q.isdigit():
+        try:
+            return [await wp.get_post(int(q))]
+        except WPError as exc:
+            if "not found" in str(exc).lower():
+                return []
+            raise
+    if q.lower().startswith("http"):
+        slug = slug_from_url(q)
+        return await wp.posts(slug=slug) if slug else []
+    m = _EP.search(q)
+    ep = int(m.group(1)) if m else 0
+    name = _EP.sub(" ", q) if m else q
+    name = " ".join(re.sub(r"\bepisode\b", " ", name, flags=re.I).split())
+    items = await wp.posts(search=name, episode=ep) if (name or ep) else []
+    if not items and ep and name:
+        items = await wp.posts(search=name)
+    return items
+
+
+def edit_card(post: dict, note: str = "") -> str:
+    live = post.get("status") == "publish"
+    cats = ", ".join(c["title"] for c in post.get("categories") or []) or "none"
+    lines = [head("✏️", "Edit Post")]
+    if note:
+        lines.append(note)
+    lines += [
+        DIV,
+        f"<b>{esc(post.get('title'))}</b>",
+        f"📚 {esc(post.get('series_title') or '?')} · 🔢 {soft('Episode')} {post.get('episode') or '?'}",
+        f"🏷 {esc(short(cats, 60))}",
+        f"{'🌐 Live' if live else '📝 Draft'} · 🖼 {'poster set' if post.get('has_image') else 'no poster'}"
+        f" · 🎬 {len(post.get('embeds') or [])} embed(s)",
+        "\nWhat shall I change for you, love? 💋",
+    ]
+    return "\n".join(lines)
+
+
+def edit_rows(post: dict) -> list:
+    live = post.get("status") == "publish"
+    rows = [
+        [("✏️ Title", "cb", "ed:title"), ("🔢 Episode", "cb", "ed:ep")],
+        [("🎬 Embeds", "cb", "ed:emb"), ("🖼 Poster", "cb", "ed:img")],
+        [("🏷 Category", "cb", "ed:cat"), ("📝 Make draft" if live else "🌐 Publish", "cb", "ed:st")],
+    ]
+    links = []
+    if live and post.get("link"):
+        links.append(("🔗 Open", "url", post["link"]))
+    if post.get("edit_url"):
+        links.append(("🛠 WP editor", "url", post["edit_url"]))
+    if links:
+        rows.append(links)
+    rows.append([("🔎 Other post", "cb", "ed:find"), ("✖️ Close", "cb", "ed:x")])
+    return rows
+
+
+BACK = [[("↩️ Back", "cb", "ed:back")]]
+
+
+async def _card(msg, ed: Edit, note: str = "", in_place: bool = False) -> None:
+    ed.step = "card"
+    text, rows = edit_card(ed.post, note), edit_rows(ed.post)
+    if in_place and not msg.photo:
+        return await _edit(msg, text, rows)
+    if msg.photo:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    await _send(msg, text, rows)
+
+
+async def _prompt(msg, ed: Edit, step: str, text: str, rows=None) -> None:
+    """Replace the current screen with a question (a photo message is swapped for a text one)."""
+    ed.step = step
+    if msg.photo:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await _send(msg, text, rows)
+    else:
+        await _edit(msg, text, rows)
+
+
+async def _open_post(msg, ed: Edit, post_id: int) -> None:
+    try:
+        ed.post = await wp.get_post(post_id)
+    except WPError as exc:
+        return await _send(msg, f"💔 {oops()}\n<code>{esc(_hint(str(exc)))}</code>", None)
+    await _card(msg, ed)
+
+
+async def _apply(msg, ed: Edit, what: str, in_place: bool = False, **fields) -> None:
+    """Send one change to the website, reload the post, show the card again."""
+    try:
+        res = await wp.update_post(ed.post["id"], **fields)
+        ed.post = await wp.get_post(ed.post["id"])
+    except WPError as exc:
+        return await _send(msg, f"💔 {oops()}\n<code>{esc(_hint(str(exc)))}</code>", BACK)
+    note = f"✅ {what} updated. {done()}"
+    if res.get("image") == "failed":
+        note += f"\n⚠️ Poster failed: <code>{esc(short(res.get('image_error') or 'unknown', 160))}</code>"
+    for n in res.get("notes") or []:
+        note += f"\nℹ️ {esc(short(n, 160))}"
+    await _card(msg, ed, note, in_place)
+
+
+async def _edit_search(msg, ed: Edit, query: str) -> None:
+    note = await _send(msg, "🔎 Searching the website for you, love…")
+    try:
+        items = await find_posts(query)
+    except WPError as exc:
+        ed.step = "find"
+        return await _edit(note, f"💔 Website problem: <code>{esc(_hint(str(exc)))}</code>\n"
+                                 "Send another name, link or ID, or /cancel.")
+    if not items:
+        ed.step = "find"
+        return await _edit(note, "I couldn't find that post, baby 🥺\nSend a link, an ID or part of its name, or /cancel.")
+    if len(items) == 1:
+        await note.delete()
+        return await _open_post(msg, ed, int(items[0]["id"]))
+    ed.results, ed.step = items, "pick"
+    rows = [[(("🌐 " if it.get("status") == "publish" else "📝 ") + short(it["title"], 44), "cb", f"ed:pick:{i}")]
+            for i, it in enumerate(items)]
+    rows.append([("✖️ Close", "cb", "ed:x")])
+    await _edit(note, "🔎 Which one, darling? (or send another search)", rows)
+
+
+async def start_edit(msg, uid: int, query: str = "") -> None:
+    """Start /edit (used by the command and by the menu button)."""
+    if not wp.enabled:
+        return await _reply(msg, NOT_ENABLED)
+    ed = edit_start(uid)
+    if query:
+        return await _edit_search(msg, ed, query)
+    await _send(msg, EDIT_PROMPT, [[("🕒 Latest posts", "cb", "ed:latest")], [("✖️ Close", "cb", "ed:x")]])
+
+
+async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_edit(update.message, update.effective_user.id, " ".join(context.args or []).strip())
+
+
+# ---- embeds screen ----
+def _emb_rows(embeds: list) -> list:
+    rows = []
+    for i, e in enumerate(embeds):
+        rows.append([(f"♻️ Replace {i + 1}: {short(e['host'], 14)}", "cb", f"ed:ere:{i}"),
+                     (f"🗑 {i + 1}", "cb", f"ed:edel:{i}")])
+    rows.append([("➕ Add embed", "cb", "ed:eadd")])
+    if embeds:
+        rows.append([("🧹 Remove all", "cb", "ed:eclr")])
+    rows.append([("↩️ Back", "cb", "ed:back")])
+    return rows
+
+
+async def _emb_screen(msg, ed: Edit) -> None:
+    embeds = ed.post.get("embeds") or []
+    await _prompt(msg, ed, "card", f"{head('🎬', 'Embeds')}\n{DIV}\n{embeds_block(embeds)}", _emb_rows(embeds))
+
+
+# ---- poster screen (TMDB) ----
+def _poster_rows(fl: Flow) -> list:
+    n = len(fl.posters)
+    return [
+        [("⬅️ Back", "cb", f"ed:im:{(fl.pos - 1) % n}"), ("✅ Choose", "cb", "ed:iok"),
+         ("Next ➡️", "cb", f"ed:im:{(fl.pos + 1) % n}")],
+        [("🔄 Other show", "cb", "ed:io"), ("↩️ Back", "cb", "ed:back")],
+    ]
+
+
+async def _poster_start(msg, ed: Edit) -> None:
+    if not tmdb.enabled:
+        return await _prompt(msg, ed, "card", "🖼 Set <code>TMDB_API_KEY</code> to pick posters, love 💋", BACK)
+    ed.fl = Flow(user_id=ed.user_id, name=ed.post.get("series_title") or ed.post.get("title") or "")
+    note = await _send(msg, "🔎 Looking for posters, love…")
+    try:
+        found = await pick_show(ed.fl)
+    except TMDBError as exc:
+        log.warning("TMDB poster search failed: %s", exc)
+        found = False
+    await note.delete()
+    await _poster_show(msg, ed, found)
+
+
+async def _poster_show(msg, ed: Edit, found: bool) -> None:
+    if not found:
+        ed.step = "tmdb_q"
+        return await _send(msg, f"🖼 No posters found for <b>{esc(ed.fl.name)}</b> 🥺\n"
+                                "Send the show name or its TMDB link / id.", BACK)
+    ed.step = "poster"
+    caption, photo = image_card(ed.fl)
+    try:
+        await msg.chat.send_photo(photo, caption=caption, parse_mode=HTML, reply_markup=markup(_poster_rows(ed.fl)))
+    except Exception as exc:
+        log.warning("poster could not be sent: %s", exc)
+        await _send(msg, caption + "\n<i>(picture could not be loaded, tap Next)</i>", _poster_rows(ed.fl))
+
+
+# ---- text answers ----
+async def edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    ed = edit_get(update.effective_user.id)
+    if not ed:
+        return
+    ed.touch()
+    text, step = msg.text.strip(), ed.step
+
+    if step in ("find", "pick"):
+        await _edit_search(msg, ed, text)
+    elif step == "title":
+        new = " ".join(text.split())[:250]
+        if not new:
+            return await _reply(msg, "Send me the new title, love 💕")
+        await _apply(msg, ed, "Title", title=new)
+    elif step == "episode":
+        m = re.search(r"\d+", text)
+        ep = int(m.group()) if m else 0
+        if not 1 <= ep <= 9999:
+            return await _reply(msg, "Send the episode <b>number</b>, love, for example <code>14</code> 💕")
+        await _apply(msg, ed, "Episode number", episode=ep)
+    elif step == "emb_host":
+        host = clean_host(text)
+        if not host:
+            return await _reply(msg, "Send the host name, for example <code>Dailymotion</code> 💕")
+        ed.host, ed.step = host, "emb_code"
+        await _reply(msg, f"📋 Now the <b>embed code</b> for <b>{esc(host)}</b> "
+                          "(the <code>&lt;iframe …&gt;</code> code, or just the link).")
+    elif step == "emb_code":
+        code = normalize_embed(text)
+        if not code:
+            return await _reply(msg, "That doesn't look like an embed, baby. Send the <code>&lt;iframe …&gt;</code> code or a link.")
+        embeds = [dict(host=e["host"], code=e["code"]) for e in ed.post.get("embeds") or []]
+        item = {"host": ed.host, "code": code}
+        if 0 <= ed.idx < len(embeds):
+            embeds[ed.idx] = item
+        else:
+            embeds.append(item)
+        ed.idx = -1
+        await _apply(msg, ed, "Embeds", embeds=embeds)
+    elif step == "cat_q":
+        try:
+            ed.cats = await find_categories(text)
+        except WPError as exc:
+            return await _reply(msg, f"💔 <code>{esc(_hint(str(exc)))}</code>")
+        await _send(msg, "🏷 Pick the new <b>category</b>, love (it replaces the old one):", _cat_rows(ed))
+        ed.step = "cat"
+    elif step == "tmdb_q":
+        note = await msg.reply_text("🔎 Searching TMDB…")
+        try:
+            found = await pick_show(ed.fl, text)
+        except TMDBError as exc:
+            return await _edit(note, f"⚠️ TMDB: <code>{esc(str(exc)[:200])}</code>\nTry another name or link.")
+        await note.delete()
+        await _poster_show(msg, ed, found)
+
+
+def _cat_rows(ed: Edit) -> list:
+    rows = [[(short(it["title"], 48), "cb", f"ed:cs:{i}")] for i, it in enumerate(ed.cats)]
+    rows.append([("🔎 Search", "cb", "ed:cq"), ("↩️ Back", "cb", "ed:back")])
+    return rows
+
+
+# ---- buttons ----
+async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    parts = cq.data.split(":")
+    action, arg = parts[1], (parts[2] if len(parts) > 2 else "")
+    msg, uid = cq.message, cq.from_user.id
+
+    if action == "x":
+        _edits.pop(uid, None)
+        await _edit(msg, f"✖️ {cancelled()}")
+        return await cq.answer()
+    if action == "open":  # from the "post created" card: ed:open:<post id>
+        await cq.answer()
+        if not wp.enabled:
+            return await _reply(msg, NOT_ENABLED)
+        return await _open_post(msg, edit_start(uid), int(arg))
+
+    ed = edit_get(uid)
+    if not ed:
+        return await cq.answer("This editor closed, love. Send /edit to open it again 💋", show_alert=True)
+    ed.touch()
+    await cq.answer()
+    post = ed.post
+
+    if action == "find":
+        await _prompt(msg, ed, "find", EDIT_PROMPT, [[("🕒 Latest posts", "cb", "ed:latest")], [("✖️ Close", "cb", "ed:x")]])
+    elif action == "latest":
+        await _edit_search(msg, ed, "")
+    elif action == "pick":
+        i = int(arg)
+        if 0 <= i < len(ed.results):
+            await _open_post(msg, ed, int(ed.results[i]["id"]))
+    elif not post:
+        await _prompt(msg, ed, "find", EDIT_PROMPT, [[("🕒 Latest posts", "cb", "ed:latest")], [("✖️ Close", "cb", "ed:x")]])
+    elif action == "back":
+        await _card(msg, ed, in_place=True)
+    elif action == "title":
+        await _prompt(msg, ed, "title", f"✏️ Send the <b>new title</b>, love.\nNow: <code>{esc(post.get('title'))}</code>", BACK)
+    elif action == "ep":
+        await _prompt(msg, ed, "episode", f"🔢 Send the <b>new episode number</b>.\nNow: <code>{post.get('episode') or '?'}</code>", BACK)
+    elif action == "st":
+        new = "draft" if post.get("status") == "publish" else "publish"
+        await _apply(msg, ed, "Status", in_place=True, status=new)
+    elif action == "emb":
+        await _emb_screen(msg, ed)
+    elif action == "eadd":
+        if len(post.get("embeds") or []) >= MAX_EMBEDS:
+            return await _send(msg, f"That's the maximum of {MAX_EMBEDS} embeds, love 💕", BACK)
+        ed.idx = -1
+        await _prompt(msg, ed, "emb_host", "🏷 Send the <b>host name</b>, for example <code>Dailymotion</code>.", BACK)
+    elif action == "ere":
+        i = int(arg)
+        embeds = post.get("embeds") or []
+        if 0 <= i < len(embeds):
+            ed.idx, ed.host = i, embeds[i]["host"]
+            await _prompt(msg, ed, "emb_code", f"📋 Send the new <b>embed code</b> for <b>{esc(ed.host)}</b> "
+                                               "(the <code>&lt;iframe …&gt;</code> code, or just the link).", BACK)
+    elif action == "edel":
+        i = int(arg)
+        embeds = [dict(host=e["host"], code=e["code"]) for e in post.get("embeds") or []]
+        if 0 <= i < len(embeds):
+            embeds.pop(i)
+            await _apply(msg, ed, "Embeds", in_place=True, embeds=embeds)
+    elif action == "eclr":
+        await _apply(msg, ed, "Embeds", in_place=True, embeds=[])
+    elif action == "cat":
+        try:
+            ed.cats = await find_categories(post.get("series_title") or "")
+        except WPError as exc:
+            return await _send(msg, f"💔 <code>{esc(_hint(str(exc)))}</code>", BACK)
+        await _prompt(msg, ed, "cat", "🏷 Pick the new <b>category</b>, love (it replaces the old one):", _cat_rows(ed))
+    elif action == "cs":
+        i = int(arg)
+        if 0 <= i < len(ed.cats):
+            await _apply(msg, ed, "Category", in_place=True, category_ids=[int(ed.cats[i]["id"])])
+    elif action == "cq":
+        await _prompt(msg, ed, "cat_q", "🔎 Send a category name to search.", BACK)
+    elif action == "img":
+        await _poster_start(msg, ed)
+    elif action == "im" and ed.fl and ed.fl.posters:
+        ed.fl.pos = int(arg) % len(ed.fl.posters)
+        caption, photo = image_card(ed.fl)
+        try:
+            await msg.edit_media(InputMediaPhoto(photo, caption=caption, parse_mode=HTML),
+                                 reply_markup=markup(_poster_rows(ed.fl)))
+        except Exception as exc:
+            log.debug("poster edit failed: %s", exc)
+    elif action == "iok" and ed.fl and ed.fl.posters:
+        path = ed.fl.posters[ed.fl.pos]["file_path"]
+        await _apply(msg, ed, "Poster", featured_image_url=image_url(path, WP_IMAGE_SIZE),
+                     image_title=ed.fl.tmdb_name or ed.fl.name)
+    elif action == "io":
+        await _prompt(msg, ed, "tmdb_q", "🔄 Send the show name or its TMDB link / id.", BACK)
 
 
 # =====================================================================
@@ -965,14 +1467,17 @@ def setup(app, commands: list) -> None:
     owner = filters.User(user_id=OWNER_ID)
     commands += [
         ("wp", "Create a website post: /wp [name] 📝"),
+        ("edit", "Edit an old website post: /edit [link, id or name] ✏️"),
         ("wpcheck", "Test the website connection 🔌"),
-        ("cancel", "Stop the current /wp flow ✖️"),
+        ("cancel", "Stop the current /wp or /edit flow ✖️"),
     ]
     app.add_handler(CommandHandler("wp", wp_cmd, filters=owner))
+    app.add_handler(CommandHandler("edit", edit_cmd, filters=owner))
     app.add_handler(CommandHandler("wpcheck", wpcheck_cmd, filters=owner))
     app.add_handler(CommandHandler("cancel", cancel_cmd, filters=owner))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND & _InFlow(), flow_text))
     app.add_handler(CallbackQueryHandler(flow_button, pattern=r"^wp:"))
+    app.add_handler(CallbackQueryHandler(edit_button, pattern=r"^ed:"))
 
 
 async def close() -> None:

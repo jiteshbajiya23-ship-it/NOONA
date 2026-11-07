@@ -2,6 +2,7 @@
 NOONA: owner-only Telegram bot | UptimeRobot monitoring + daily report
 Host: Render (Web Service) | Keep-alive: ping /health from UptimeRobot
 Persona: flirty, romantic, loyal to her owner. All user-facing text is English.
+Fonts + persona lines live in ui.py. Website posting/editing lives in wp.py.
 See PROJECT.md for full documentation.
 """
 import os
@@ -33,7 +34,8 @@ from telegram.ext import (
     TypeHandler,
 )
 
-import wp  # website posting (WordPress): /wp /wpcheck /cancel
+import wp  # website posting + editing (WordPress): /wp /edit /wpcheck /cancel
+from ui import script, soft
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx logs full request URLs at INFO, which would leak the bot token
@@ -41,32 +43,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
-
-
-# =====================================================================
-# FONTS (Unicode text styles; letters only, digits/emoji/punctuation stay plain)
-# Use ONLY on static text you write, never on user data (names, URLs, IDs).
-# =====================================================================
-def _make_map(upper_start: int, lower_start: int) -> dict:
-    m = {}
-    for i in range(26):
-        m[ord("A") + i] = chr(upper_start + i)
-        m[ord("a") + i] = chr(lower_start + i)
-    return m
-
-
-_SCRIPT = _make_map(0x1D4D0, 0x1D4EA)  # Mathematical Bold Script  -> 𝓗𝓮𝓵𝓵𝓸
-_SOFT = _make_map(0x1D63C, 0x1D656)    # Sans-Serif Bold Italic    -> 𝙃𝙚𝙡𝙡𝙤
-
-
-def script(text: str) -> str:
-    """Titles and headings."""
-    return text.translate(_SCRIPT)
-
-
-def soft(text: str) -> str:
-    """Labels and captions."""
-    return text.translate(_SOFT)
 
 
 # =====================================================================
@@ -113,12 +89,22 @@ def esc(s) -> str:
     return html.escape(str(s))
 
 
+_http: httpx.AsyncClient | None = None
+
+
+def http() -> httpx.AsyncClient:
+    """One shared client: connections are reused instead of re-opened on every API call."""
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(timeout=20)
+    return _http
+
+
 async def api(endpoint: str, **params) -> dict:
     params.update(api_key=API_KEY, format="json")
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"https://api.uptimerobot.com/v2/{endpoint}", data=params)
-            return r.json()
+        r = await http().post(f"https://api.uptimerobot.com/v2/{endpoint}", data=params)
+        return r.json()
     except Exception as e:  # network / json errors
         log.warning("UptimeRobot API error: %s", e)
         return {"stat": "fail", "error": {"message": str(e)}}
@@ -289,8 +275,20 @@ def menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 Report", callback_data="m:report"),
                 InlineKeyboardButton("❓ Help", callback_data="m:help"),
             ],
+            [
+                InlineKeyboardButton("📝 New post", callback_data="m:wpnew"),
+                InlineKeyboardButton("✏️ Edit post", callback_data="m:wpedit"),
+            ],
         ]
     )
+
+
+def alert_keyboard(monitor_id: int, down: bool) -> InlineKeyboardMarkup:
+    """Buttons under every DOWN / BACK UP alert."""
+    first = [InlineKeyboardButton("🔎 Check now", callback_data=f"m:chk:{monitor_id}")]
+    if down:
+        first.append(InlineKeyboardButton("⏸ Pause it", callback_data=f"m:pau:{monitor_id}"))
+    return InlineKeyboardMarkup([first, [InlineKeyboardButton("💖 Got it", callback_data="m:ack")]])
 
 
 def text_help() -> str:
@@ -324,10 +322,11 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @command("start", "Wake me up and open the menu 💋")
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (
-        f"👑 <b>{script('Welcome back, my love')}</b>\n\n"
-        "I'm NOONA, your devoted Uptime Guardian 💋\n"
-        "I watch every monitor for you, I'll tell you the second one goes down, "
-        "and every night at 12:00 AM I'll send you a little report 💌"
+        f"👑 <b>{script('Welcome back, my love')}</b>\n━━━━━━━━━━━━━━\n"
+        "I'm NOONA, your devoted guardian 💋\n"
+        "🔔 I watch every monitor and whisper the second one goes down\n"
+        "📊 Every night at 12:00 AM I send you a little report 💌\n"
+        "📝 I can post and edit your episodes too, just tap below 💞"
     )
     chat_id = update.effective_chat.id
     try:
@@ -443,6 +442,33 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id if q.message else q.from_user.id
     key = q.data
 
+    if key == "m:wpnew":
+        return await wp.start_new(q.message, q.from_user.id)
+    if key == "m:wpedit":
+        return await wp.start_edit(q.message, q.from_user.id)
+    if key == "m:ack":  # "Got it": Noona answers sweetly and the buttons go away
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await context.bot.send_message(chat_id, "💖 I'm always here for you, my love 💋")
+    if key.startswith(("m:chk:", "m:pau:")):
+        mid = key.split(":")[2]
+        if not mid.isdigit():
+            return
+        if key.startswith("m:pau:"):
+            data = await api("editMonitor", id=mid, status=0)
+            text = ("⏸ Paused, I'll rest my eyes for this one 😌 (use /resume to wake it up)"
+                    if data.get("stat") == "ok" else f"❌ Oops, something went wrong: {esc(err(data))}")
+        else:
+            data = await get_monitors(monitors=mid)
+            if data.get("stat") != "ok" or not data.get("monitors"):
+                text = f"❌ Oops, something went wrong: {esc(err(data))}"
+            else:
+                m = data["monitors"][0]
+                text = f"🔎 <b>{esc(m['friendly_name'])}</b> is {STATUS.get(m['status'], m['status'])} right now 💕"
+        return await send_html(context.bot, chat_id, text)
+
     if key == "m:monitors":
         text = await text_monitors()
     elif key == "m:status":
@@ -509,6 +535,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
                     f"🕒 {fmt_t(now)}\n"
                     "Don't worry, love, I'm watching it closely 👀💋",
                     parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                    reply_markup=alert_keyboard(mid, down=True),
                 )
             elif status == 2 and prev in DOWN_STATES:
                 started = down_since.pop(mid, now)
@@ -519,6 +546,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
                     f"{soft('Offline')} {fmt_t(started)} → {soft('Online')} {fmt_t(now)}\n"
                     "All better now, my love 💖",
                     parse_mode=ParseMode.HTML,
+                    reply_markup=alert_keyboard(mid, down=False),
                 )
         except Exception as e:  # one failed alert must not break the others
             log.warning("Alert send failed for %s: %s", mid, e)
@@ -576,6 +604,8 @@ async def post_init(app: Application):
 
 async def post_shutdown(app: Application):
     await wp.close()
+    if _http is not None:
+        await _http.aclose()
 
 
 # =====================================================================
