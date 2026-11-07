@@ -31,6 +31,9 @@ NOONA is an **owner-only Telegram bot** that connects to [UptimeRobot](https://u
 | `/resume <id>` | Resume a monitor ▶️ |
 | `/report [hours]` | Report for the last N hours (default 24, max 720) 📊 |
 | `/ping` | Check bot uptime and API speed 🏓 |
+| `/wp [name]` | Create a website episode post (series, category, episode, embeds, featured image) 📝 |
+| `/wpcheck` | Test the connection to the website plugin 🔌 |
+| `/cancel` | Stop the current `/wp` flow ✖️ |
 
 ---
 
@@ -62,6 +65,14 @@ pip install -r requirements.txt
 | `CHECK_EVERY` | ❌ | `60` | Seconds between status checks |
 | `WELCOME_IMAGE` | ❌ | built-in URL | Image shown on `/start` |
 | `NOTIFY_STARTUP` | ❌ | `1` | Set `0` to skip the "I'm online" message |
+| `WP_BOT_TOKEN` | ➖ | n/a | Website posting: the secret inside `wordpress/xiaobhai-episode-api.php` (20+ chars) |
+| `WP_URL` | ➖ | `https://xiaobhaidonghua.com` | Your WordPress site |
+| `WP_POST_STATUS` | ➖ | `publish` | `publish` (live) or `draft` |
+| `WP_REFERENCE_URL` | ➖ | Jade Dynasty ep 14 | An existing episode post **with an embed**; `/wpcheck` learns the theme's fields from it |
+| `TMDB_API_KEY` | ➖ | n/a | Needed for the featured-image step of `/wp` (v3 key or v4 token) |
+| `WP_IMAGE_SIZE` | ➖ | `w780` | TMDB size of the featured image: `w500`, `w780`, `original` |
+
+**Website posting setup (one time):** put your secret in `wordpress/xiaobhai-episode-api.php` (`define('XB_BOT_TOKEN', '...')`), upload that file to `wp-content/mu-plugins/` on the site, set `WP_BOT_TOKEN` to the same secret, redeploy, then send `/wpcheck`. Logic lives in `wp.py`.
 
 ### 4. Run ▶️
 

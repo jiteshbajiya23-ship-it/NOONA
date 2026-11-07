@@ -33,6 +33,8 @@ from telegram.ext import (
     TypeHandler,
 )
 
+import wp  # website posting (WordPress): /wp /wpcheck /cancel
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx logs full request URLs at INFO, which would leak the bot token
 # (https://api.telegram.org/bot<TOKEN>/...) into the logs. Keep these quiet.
@@ -572,6 +574,10 @@ async def post_init(app: Application):
     await start_web()
 
 
+async def post_shutdown(app: Application):
+    await wp.close()
+
+
 # =====================================================================
 # MAIN
 # =====================================================================
@@ -583,6 +589,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         # default timeouts are 5s, which causes "Timed out" on a Render cold start
         .connect_timeout(20)
         .read_timeout(20)
@@ -599,6 +606,7 @@ def main():
     for h in HANDLERS:
         app.add_handler(h)
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^m:"))
+    wp.setup(app, COMMANDS)  # adds /wp /wpcheck /cancel to the handlers, menu and /help
     app.add_error_handler(on_error)
 
     # misfire_grace_time: APScheduler skips jobs that start >1s late by default
