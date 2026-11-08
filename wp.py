@@ -233,7 +233,7 @@ class WordPress:
                     raise WPError(f"{data.get('message') or data['code']} (HTTP {status})")
                 errors.append(f"[{way}] {data.get('message') or data['code']} (HTTP {status})"[:200])
                 continue
-            errors.append(f"[{way}] HTTP {status} - not the plugin's answer, probably a firewall/cache page: "
+            errors.append(f"[{way} {method} {route}] HTTP {status} - not the plugin's answer, probably a firewall/cache page: "
                           f"{_snippet(getattr(resp, 'text', ''), 60)}")
         raise WPError("\n".join(errors) or "no answer")
 
@@ -273,13 +273,22 @@ class WordPress:
         return (await self._call("GET", "/posts", params)).get("items") or []
 
     async def get_post(self, post_id: int) -> dict:
-        return await self._call("GET", f"/post/{int(post_id)}")
+        # id travels as a query value on /posts (same shape as /series), not as a /post/<id> path:
+        # some firewalls block the numeric path.  Needs plugin 1.3+.
+        data = await self._call("GET", "/posts", {"id": int(post_id)})
+        post = data.get("post")
+        if not isinstance(post, dict):
+            if data.get("items") is not None:
+                raise WPError("The website plugin is old. Upload the new xiaobhai-episode-api.php (v1.3) and send /wpcheck.")
+            raise WPError("Post not found.")
+        return post
 
     async def update_post(self, post_id: int, **fields) -> dict:
         """Send only what changes: title, status, episode, series_id, category_ids, embeds (full list),
         featured_image_url, image_title."""
         body = {k: v for k, v in fields.items() if v is not None}
-        return await self._call("POST", f"/post/{int(post_id)}", body=body)
+        body["post_id"] = int(post_id)  # POST /episode already works; with post_id it updates instead of creating
+        return await self._call("POST", "/episode", body=body)
 
 
 wp = WordPress()
@@ -1024,7 +1033,7 @@ async def wpcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Send this to your developer/Claude:\n<pre>{esc(dump)}</pre>")
     m = cal["map"]
     plugin = str(info.get("plugin") or "1.0.0")
-    new_plugin = _version(plugin) >= (1, 2)
+    new_plugin = _version(plugin) >= (1, 3)
     if m.get("embed_key"):
         embed_line = f"• Embeds → <code>{esc(m['embed_key'])}</code> ({esc(m.get('embed_shape'))})"
     else:
@@ -1042,7 +1051,7 @@ async def wpcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{embed_line}\n\n"
         f"New posts are created as: <b>{WP_POST_STATUS}</b>"
         + ("" if new_plugin else "\n\n⚠️ The plugin on the website is <b>old</b>: upload the new "
-           "<code>xiaobhai-episode-api.php</code> (embeds, featured image and /edit need version 1.2)."))
+           "<code>xiaobhai-episode-api.php</code> (embeds, featured image and /edit need version 1.3)."))
 
 
 # =====================================================================
